@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from enum import IntEnum
 from functools import cache
 from typing import TYPE_CHECKING, Literal
@@ -519,6 +520,41 @@ def silu_and_mul_per_block_quant(
     scale_ub: torch.Tensor | None = None,
     is_scale_transposed: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    return _act_and_mul_per_block_quant(
+        torch.ops._C.silu_and_mul_per_block_quant,
+        input,
+        group_size,
+        quant_dtype,
+        scale_ub,
+        is_scale_transposed,
+    )
+
+
+def gelu_tanh_and_mul_per_block_quant(
+    input: torch.Tensor,
+    group_size: int,
+    quant_dtype: torch.dtype,
+    scale_ub: torch.Tensor | None = None,
+    is_scale_transposed: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _act_and_mul_per_block_quant(
+        torch.ops._C.gelu_tanh_and_mul_per_block_quant,
+        input,
+        group_size,
+        quant_dtype,
+        scale_ub,
+        is_scale_transposed,
+    )
+
+
+def _act_and_mul_per_block_quant(
+    op: Callable[..., None],
+    input: torch.Tensor,
+    group_size: int,
+    quant_dtype: torch.dtype,
+    scale_ub: torch.Tensor | None,
+    is_scale_transposed: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert input.ndim == 2, f"input must be 2D [batch, hidden*2], got {input.shape}"
     assert input.shape[-1] % 2 == 0, (
         f"input last dim must be even (gate||up layout), got {input.shape[-1]}"
@@ -549,7 +585,7 @@ def silu_and_mul_per_block_quant(
         )
 
     # Call the C++ kernel
-    torch.ops._C.silu_and_mul_per_block_quant(
+    op(
         output,
         input,
         scales,

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 import vllm._custom_ops as ops
 from tests.kernels.utils import opcheck
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -27,20 +27,30 @@ SEEDS = [0]
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
 ]
+# (activation layer factory, fused static-FP8 op): SwiGLU and GeGLU (tanh).
+ACTIVATIONS = {
+    "silu": (SiluAndMul, torch.ops._C.silu_and_mul_quant),
+    "gelu_tanh": (
+        lambda: GeluAndMul(approximate="tanh"),
+        torch.ops._C.gelu_tanh_and_mul_quant,
+    ),
+}
 
 
 def ref_impl(
-    silu_and_mul: SiluAndMul, x: torch.Tensor, scale: torch.Tensor
+    act_and_mul: torch.nn.Module, x: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    silu_and_mul_out = silu_and_mul.forward_native(x)
-    out, scales = ops.scaled_fp8_quant(silu_and_mul_out, scale)
+    act_and_mul_out = act_and_mul.forward_native(x)
+    out, scales = ops.scaled_fp8_quant(act_and_mul_out, scale)
     return out
 
 
-def ops_impl(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def ops_impl(x: torch.Tensor, scale: torch.Tensor, fused_op=None) -> torch.Tensor:
+    if fused_op is None:
+        fused_op = torch.ops._C.silu_and_mul_quant
     out_shape = (x.shape[0], x.shape[1] // 2)
     out = torch.empty(out_shape, dtype=current_platform.fp8_dtype(), device=x.device)
-    torch.ops._C.silu_and_mul_quant(out, x, scale)
+    fused_op(out, x, scale)
     return out
 
 
@@ -48,29 +58,32 @@ def ops_impl(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize("activation", list(ACTIVATIONS))
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_silu_and_mul(
+def test_act_and_mul_quant(
     default_vllm_config,
     num_tokens: int,
     hidden_size: int,
     dtype: torch.dtype,
     quant_dtype: torch.dtype,
+    activation: str,
     seed: int,
     device: str,
 ) -> None:
     set_random_seed(seed)
     torch.set_default_device(device)
 
-    layer = SiluAndMul()
+    make_layer, fused_op = ACTIVATIONS[activation]
+    layer = make_layer()
 
     # Make inputs
     scale = torch.randn((1), device=device, dtype=torch.float32)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
 
     ref_out = ref_impl(layer, x, scale)
-    ops_out = ops_impl(x, scale)
+    ops_out = ops_impl(x, scale, fused_op)
 
     assert ref_out.dtype == quant_dtype
     assert ops_out.dtype == quant_dtype
@@ -78,7 +91,7 @@ def test_silu_and_mul(
     assert torch.allclose(
         ref_out.to(dtype=torch.float32), ops_out.to(dtype=torch.float32)
     )
-    opcheck(torch.ops._C.silu_and_mul_quant, (ops_out, x, scale))
+    opcheck(fused_op, (ops_out, x, scale))
 
 
 # ---------------------------------------------------------------------------
@@ -118,18 +131,20 @@ class MockLinearRequiresUnquantized(MockLinearFp8Static):
 @pytest.mark.parametrize("token_shape", [(1,), (16,), (128,), (1, 17), (2, 17)])
 @pytest.mark.parametrize("hidden_size", [128, 512, 1024])
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("activation", list(ACTIVATIONS))
 @torch.inference_mode()
 def test_maybe_fused_act_quant_fp8_static(
     default_vllm_config,
     token_shape: tuple[int, ...],
     hidden_size: int,
     dtype: torch.dtype,
+    activation: str,
 ) -> None:
     """Test maybe_fused_act_quant with FP8 static per-tensor quantization."""
     device = "cuda:0"
     torch.set_default_device(device)
 
-    act_fn = SiluAndMul()
+    act_fn = ACTIVATIONS[activation][0]()
     scale = torch.tensor([0.5], device=device, dtype=torch.float32)
     linear = MockLinearFp8Static(scale)
 

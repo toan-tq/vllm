@@ -32,15 +32,31 @@ SEEDS = [0]
 CUDA_DEVICES = [i for i in range(1 if torch.accelerator.device_count() == 1 else 2)]
 
 
+# activation name -> (reference activation, fused python wrapper, C++ op)
+ACTIVATIONS = {
+    "silu": (
+        F.silu,
+        ops.silu_and_mul_per_block_quant,
+        torch.ops._C.silu_and_mul_per_block_quant,
+    ),
+    "gelu_tanh": (
+        lambda x: F.gelu(x, approximate="tanh"),
+        ops.gelu_tanh_and_mul_per_block_quant,
+        torch.ops._C.gelu_tanh_and_mul_per_block_quant,
+    ),
+}
+
+
 def ref_silu_and_mul_per_block_quant(
     x: torch.Tensor,
     quant_dtype: torch.dtype,
     group_size: int,
+    activation: str = "silu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference implementation: unfused SiLU+Mul then group quantization."""
+    """Reference implementation: unfused act+Mul then group quantization."""
     hidden = x.shape[-1] // 2
     gate, up = x.split(hidden, dim=-1)
-    silu_out = F.silu(gate) * up
+    silu_out = ACTIVATIONS[activation][0](gate) * up
 
     if quant_dtype == current_platform.fp8_dtype():
         return per_token_group_quant_fp8(
@@ -58,6 +74,7 @@ def ref_silu_and_mul_per_block_quant(
 @pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
 @pytest.mark.parametrize("group_size", GROUP_SIZES)
 @pytest.mark.parametrize("is_scale_transposed", IS_SCALE_TRANSPOSED)
+@pytest.mark.parametrize("activation", list(ACTIVATIONS))
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device_idx", CUDA_DEVICES)
 @torch.inference_mode()
@@ -70,10 +87,11 @@ def test_silu_and_mul_per_block_quant(
     quant_dtype: torch.dtype,
     group_size: int,
     is_scale_transposed: bool,
+    activation: str,
     seed: int,
     device_idx: str,
 ) -> None:
-    """Test SiLU+Mul+Block Quantization kernel correctness."""
+    """Test act+Mul+Block Quantization kernel correctness (SiLU, GELU-tanh)."""
     torch.accelerator.set_device_index(device_idx)
     device = f"cuda:{device_idx}"
     torch.random.manual_seed(seed)
@@ -85,14 +103,17 @@ def test_silu_and_mul_per_block_quant(
     if has_scale_ub:
         pytest.skip("Scale upper bound not yet supported")
 
+    _, fused_fn, fused_op = ACTIVATIONS[activation]
     scale = 1 / hidden_size
     x = torch.randn(num_tokens, hidden_size * 2, dtype=dtype, device=device) * scale
 
     # Reference implementation
-    ref_out, ref_scales = ref_silu_and_mul_per_block_quant(x, quant_dtype, group_size)
+    ref_out, ref_scales = ref_silu_and_mul_per_block_quant(
+        x, quant_dtype, group_size, activation
+    )
 
     # Fused kernel implementation
-    ops_out, ops_scales = ops.silu_and_mul_per_block_quant(
+    ops_out, ops_scales = fused_fn(
         x, group_size, quant_dtype, None, is_scale_transposed
     )
 
@@ -124,7 +145,7 @@ def test_silu_and_mul_per_block_quant(
     else:
         scales = torch.empty(num_tokens, num_groups, device=device, dtype=torch.float32)
     opcheck(
-        torch.ops._C.silu_and_mul_per_block_quant,
+        fused_op,
         (output, x, scales, group_size, None, is_scale_transposed),
     )
 

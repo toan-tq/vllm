@@ -14,6 +14,8 @@ from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from vllm.compilation.passes.fusion.act_quant_fusion import (
     FUSED_OPS,
+    GELU_TANH_FUSED_OPS,
+    GELU_TANH_MUL_OP,
     SILU_MUL_OP,
     ActivationQuantFusionPass,
 )
@@ -34,7 +36,7 @@ from vllm.model_executor.kernels.linear import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     ROCmFP8ScaledMMLinearKernel,
 )
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -95,6 +97,28 @@ class TestSiluMulFp8QuantModel(torch.nn.Module):
 
     def ops_in_model_after(self):
         return [FUSED_OPS[kFp8StaticTensorSym]]
+
+
+class TestGeluTanhMulFp8QuantModel(TestSiluMulFp8QuantModel):
+    """GeGLU (tanh approximation) variant, as in the Gemma 2/3/4 MLPs."""
+
+    def __init__(self, hidden_size: int, force_kernel, dtype: torch.dtype, **kwargs):
+        super().__init__(hidden_size, force_kernel, dtype, **kwargs)
+        self.silu_and_mul = GeluAndMul(approximate="tanh")
+        self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
+
+    def ops_in_model_before(self):
+        return [
+            GELU_TANH_MUL_OP if self.enable_silu_mul_custom_op else torch.ops.aten.mul,
+            (
+                QUANT_OPS[kFp8StaticTensorSym]
+                if self.enable_quant_fp8_custom_op
+                else torch.ops.aten.reciprocal
+            ),
+        ]
+
+    def ops_in_model_after(self):
+        return [GELU_TANH_FUSED_OPS[kFp8StaticTensorSym]]
 
 
 class TestSiluMulNvfp4QuantModel(torch.nn.Module):
@@ -217,6 +241,29 @@ class TestSiluMulBlockQuantModel(torch.nn.Module):
         return [FUSED_OPS[self.quant_key]]
 
 
+class TestGeluTanhMulBlockQuantModel(TestSiluMulBlockQuantModel):
+    """GeGLU (tanh approximation) variant of the per-block FP8 model."""
+
+    def __init__(self, hidden_size: int, is_scale_transposed: bool = False, **kwargs):
+        super().__init__(hidden_size, is_scale_transposed, **kwargs)
+        self.silu_and_mul = GeluAndMul(approximate="tanh")
+        self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
+
+    def ops_in_model_before(self):
+        ops = []
+        if self.enable_silu_mul_custom_op:
+            ops.append(GELU_TANH_MUL_OP)
+        ops.append(
+            QUANT_OPS[self.quant_key]
+            if self.enable_quant_fp8_custom_op
+            else torch.ops.aten.reciprocal.default
+        )
+        return ops
+
+    def ops_in_model_after(self):
+        return [GELU_TANH_FUSED_OPS[self.quant_key]]
+
+
 ROCM_KERNELS = [ROCmFP8ScaledMMLinearKernel, PerTensorTorchFP8ScaledMMLinearKernel]
 CUDA_KERNELS = [
     FlashInferFP8ScaledMMLinearKernel,
@@ -232,7 +279,13 @@ TEST_KERNELS = ROCM_KERNELS if current_platform.is_rocm() else CUDA_KERNELS
 @pytest.mark.parametrize("enable_silu_mul_custom_op", [True, False])
 @pytest.mark.parametrize(
     "model_class, enable_quant_fp8_custom_op, force_kernel",
-    list(itertools.product([TestSiluMulFp8QuantModel], [True, False], TEST_KERNELS))
+    list(
+        itertools.product(
+            [TestSiluMulFp8QuantModel, TestGeluTanhMulFp8QuantModel],
+            [True, False],
+            TEST_KERNELS,
+        )
+    )
     + [
         pytest.param(
             TestSiluMulNvfp4QuantModel,
@@ -255,14 +308,18 @@ TEST_KERNELS = ROCM_KERNELS if current_platform.is_rocm() else CUDA_KERNELS
         # Block quant fusion for per-group FP8 (CUDA only).
         *[
             pytest.param(
-                partial(TestSiluMulBlockQuantModel, is_scale_transposed=transposed),
+                partial(block_model_class, is_scale_transposed=transposed),
                 True,
                 None,
                 marks=pytest.mark.skipif(
                     not current_platform.is_cuda(), reason="CUDA only"
                 ),
-                id=f"TestSiluMulBlockQuant-transposed={transposed}",
+                id=f"{block_model_class.__name__}-transposed={transposed}",
             )
+            for block_model_class in [
+                TestSiluMulBlockQuantModel,
+                TestGeluTanhMulBlockQuantModel,
+            ]
             for transposed in [False, True]
         ],
     ],
@@ -291,10 +348,16 @@ def test_fusion_silu_and_mul_quant(
         pytest.skip("AITER is not supported on this GPU.")
     if (
         isinstance(model_class, partial)
-        and model_class.func is TestSiluMulBlockQuantModel
+        and issubclass(model_class.func, TestSiluMulBlockQuantModel)
         and is_deep_gemm_supported()
     ):
         pytest.skip("SiluMul+BlockQuant fusion not applicable with DeepGemm")
+    model_type = model_class.func if isinstance(model_class, partial) else model_class
+    is_gelu_tanh = issubclass(
+        model_type, TestGeluTanhMulFp8QuantModel | TestGeluTanhMulBlockQuantModel
+    )
+    if is_gelu_tanh and current_platform.is_rocm() and not enable_silu_mul_custom_op:
+        pytest.skip("ROCm's native GeluAndMul uses the exact GELU; no tanh match")
 
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
@@ -305,6 +368,7 @@ def test_fusion_silu_and_mul_quant(
     custom_ops = ["none"]
     if enable_silu_mul_custom_op:
         custom_ops.append("+silu_and_mul")
+        custom_ops.append("+gelu_and_mul")
     if enable_quant_fp8_custom_op:
         custom_ops.append("+quant_fp8")
     config = VllmConfig(

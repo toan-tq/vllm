@@ -394,6 +394,16 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor? scale_ub=None, "
       "bool is_scale_transposed=False) -> ()");
 
+  // Fused GELU(tanh)+Mul + per-block quantization
+  ops.def(
+      "gelu_tanh_and_mul_per_block_quant("
+      "Tensor! out, "
+      "Tensor input, "
+      "Tensor! scales, "
+      "int group_size, "
+      "Tensor? scale_ub=None, "
+      "bool is_scale_transposed=False) -> ()");
+
   // Rotary embedding
   // Apply GPT-NeoX or GPT-J style rotary embedding to query and key.
   ops.def(
@@ -639,6 +649,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
 
+  // GeGLU (tanh approximation) activation with FP8 quantization.
+  ops.def(
+      "gelu_tanh_and_mul_quant(Tensor! result, Tensor input, Tensor scale) "
+      "-> ()");
+
   // Activation function used in GeGLU with `none` approximation.
   ops.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
 
@@ -821,6 +836,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("rms_norm_per_block_quant", TORCH_BOX(&rms_norm_per_block_quant));
   ops.impl("silu_and_mul_per_block_quant",
            TORCH_BOX(&silu_and_mul_per_block_quant));
+  ops.impl("gelu_tanh_and_mul_per_block_quant",
+           TORCH_BOX(&gelu_tanh_and_mul_per_block_quant));
 
   // Positional encoding kernels (shared CUDA/ROCm)
   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
@@ -893,6 +910,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&persistent_masked_m_silu_mul_quant));
   ops.impl("weak_ref_tensor", TORCH_BOX(&weak_ref_tensor));
   ops.impl("silu_and_mul_quant", TORCH_BOX(&silu_and_mul_quant));
+  ops.impl("gelu_tanh_and_mul_quant", TORCH_BOX(&gelu_tanh_and_mul_quant));
   ops.impl("muse_spark_mul_tanh_soft_cap",
            TORCH_BOX(&muse_spark_mul_tanh_soft_cap));
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));

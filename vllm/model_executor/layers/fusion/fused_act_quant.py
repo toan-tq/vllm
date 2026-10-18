@@ -17,7 +17,11 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.layers.activation import ReLUSquaredActivation, SiluAndMul
+from vllm.model_executor.layers.activation import (
+    GeluAndMul,
+    ReLUSquaredActivation,
+    SiluAndMul,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -39,17 +43,17 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 
-def _silu_and_mul_fp8_static(
-    x: torch.Tensor, linear: LinearBase
+def _act_and_mul_fp8_static(
+    fused_op: Callable[..., None], x: torch.Tensor, linear: LinearBase
 ) -> QuantizedActivation:
-    """SiluAndMul + FP8 static per-tensor quantization."""
+    """Gated activation + FP8 static per-tensor quantization."""
     d = x.shape[-1] // 2
     out_shape = x.shape[:-1] + (d,)
     result = torch.empty(out_shape, dtype=FP8_DTYPE, device=x.device)
     # TODO(mgoin): read the consumer scale via the contract instead of reaching
     # into the kernel-specific input_scale attribute.
     scale = linear.input_scale
-    torch.ops._C.silu_and_mul_quant(result, x, scale)
+    fused_op(result, x, scale)
     return QuantizedActivation(
         data=result,
         scale=scale,
@@ -57,6 +61,20 @@ def _silu_and_mul_fp8_static(
         orig_shape=out_shape,
         quant_key=kFp8StaticTensorSym,
     )
+
+
+def _silu_and_mul_fp8_static(
+    x: torch.Tensor, linear: LinearBase
+) -> QuantizedActivation:
+    """SiluAndMul + FP8 static per-tensor quantization."""
+    return _act_and_mul_fp8_static(torch.ops._C.silu_and_mul_quant, x, linear)
+
+
+def _gelu_tanh_and_mul_fp8_static(
+    x: torch.Tensor, linear: LinearBase
+) -> QuantizedActivation:
+    """GeluAndMul(tanh) + FP8 static per-tensor quantization."""
+    return _act_and_mul_fp8_static(torch.ops._C.gelu_tanh_and_mul_quant, x, linear)
 
 
 def _silu_and_mul_fp8_dynamic_block(
@@ -170,11 +188,25 @@ def _relu_squared_static_fp8_quant_supported(
     )
 
 
+def _gelu_tanh_supported(
+    act_fn: torch.nn.Module, x: torch.Tensor, linear: LinearBase
+) -> bool:
+    """The fused GeGLU kernels implement only the tanh approximation."""
+    return isinstance(act_fn, GeluAndMul) and act_fn.approximate == "tanh"
+
+
 # Optional per-entry predicates preserve the unconditional fallback contract
 # for producers whose supported inputs are narrower than their registry key.
 _FUSED_ACT_QUANT_SUPPORT: dict[
     tuple[type, QuantKey], Callable[[torch.nn.Module, torch.Tensor, LinearBase], bool]
 ] = {}
+
+# The GeGLU kernel is a vLLM csrc op; builds that ship other kernels lack it.
+# No block row: no block-FP8 GEMM kernel exposes an input quant key.
+if hasattr(torch.ops._C, "gelu_tanh_and_mul_quant"):
+    _GELU_TANH_STATIC_FP8_KEY = (GeluAndMul, kFp8StaticTensorSym)
+    _FUSED_ACT_QUANT[_GELU_TANH_STATIC_FP8_KEY] = _gelu_tanh_and_mul_fp8_static
+    _FUSED_ACT_QUANT_SUPPORT[_GELU_TANH_STATIC_FP8_KEY] = _gelu_tanh_supported
 
 # This path is validated on SM90 and newer CUDA devices.
 if current_platform.is_cuda() and current_platform.has_device_capability(90):

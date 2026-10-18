@@ -3,16 +3,35 @@
 
 #include "../../torch_utils.h"
 
+#include <cmath>
+
 #include "../../dispatch_utils.h"
 #include "quant_conversions.cuh"
 
 namespace vllm {
 
+// Gated activation computed in fp32. kGeluTanh selects GELU with the 'tanh'
+// approximation (GeGLU, e.g. Gemma); otherwise SiLU (SwiGLU).
+template <bool kGeluTanh>
+__device__ __forceinline__ float act_and_mul(float gate, float up) {
+  if constexpr (kGeluTanh) {
+    // Same evaluation order as gelu_tanh_kernel in activation_kernels.cu.
+    constexpr float BETA = M_SQRT2 * M_2_SQRTPI * 0.5f;
+    constexpr float KAPPA = 0.044715;
+    float const gate_cube = gate * gate * gate;
+    float const inner = BETA * (gate + KAPPA * gate_cube);
+    return 0.5f * gate * (1.0f + tanhf(inner)) * up;
+  } else {
+    float const sigmoid_gate = 1.0f / (1.0f + expf(-gate));
+    return gate * sigmoid_gate * up;
+  }
+}
+
 // Logic: one thread block per (token, group) pair
 
 template <typename scalar_t, typename scalar_out_t, bool is_scale_transposed,
-          int32_t group_size>
-__global__ void silu_and_mul_per_block_quant_kernel(
+          int32_t group_size, bool kGeluTanh = false>
+__global__ void act_and_mul_per_block_quant_kernel(
     scalar_out_t* __restrict__ out,  // Output: [num_tokens, hidden_size] in
                                      // FP8/INT8
     float* __restrict__ scales,      // Output: [num_tokens, hidden_size /
@@ -50,14 +69,11 @@ __global__ void silu_and_mul_per_block_quant_kernel(
   // Shared memory for reduction (compile-time sized)
   __shared__ float shared_max[group_size];
 
-  // Step 1: Each thread loads one element, computes SiLU, stores in register
+  // Step 1: Each thread loads one element, computes act(gate) * up, keeps it
+  // in a register
   float gate = static_cast<float>(token_input_gate[tid]);
   float up = static_cast<float>(token_input_up[tid]);
-
-  // Compute SiLU(gate) * up
-  float sigmoid_gate = 1.0f / (1.0f + expf(-gate));
-  float silu_gate = gate * sigmoid_gate;
-  float result = silu_gate * up;  // Keep in register
+  float result = act_and_mul<kGeluTanh>(gate, up);
 
   // Step 2: Reduce to find group max
   shared_max[tid] = fabsf(result);
@@ -104,12 +120,12 @@ __global__ void silu_and_mul_per_block_quant_kernel(
 
 }  // namespace vllm
 
-void silu_and_mul_per_block_quant(torch::stable::Tensor& out,
-                                  torch::stable::Tensor const& input,
-                                  torch::stable::Tensor& scales,
-                                  int64_t group_size,
-                                  std::optional<torch::stable::Tensor> scale_ub,
-                                  bool is_scale_transposed) {
+template <bool kGeluTanh>
+static void act_and_mul_per_block_quant(
+    torch::stable::Tensor& out, torch::stable::Tensor const& input,
+    torch::stable::Tensor& scales, int64_t group_size,
+    std::optional<torch::stable::Tensor> const& scale_ub,
+    bool is_scale_transposed) {
   static torch::headeronly::ScalarType kFp8Type =
       is_fp8_ocp() ? torch::headeronly::ScalarType::Float8_e4m3fn
                    : torch::headeronly::ScalarType::Float8_e4m3fnuz;
@@ -146,28 +162,46 @@ void silu_and_mul_per_block_quant(torch::stable::Tensor& out,
   dim3 block(group_size);
 
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(
-      input.scalar_type(), "silu_and_mul_per_block_quant", [&] {
+      input.scalar_type(), "act_and_mul_per_block_quant", [&] {
         using scalar_in_t = scalar_t;
 
         VLLM_STABLE_DISPATCH_QUANT_TYPES(
-            out.scalar_type(), "silu_and_mul_per_block_quant", [&] {
+            out.scalar_type(), "act_and_mul_per_block_quant", [&] {
               using scalar_out_t = scalar_t;
 
               VLLM_STABLE_DISPATCH_GROUP_SIZE(group_size, gs, [&] {
                 VLLM_STABLE_DISPATCH_BOOL(
                     is_scale_transposed, transpose_scale, [&] {
-                      vllm::silu_and_mul_per_block_quant_kernel<
-                          scalar_in_t, scalar_out_t, transpose_scale, gs>
-                          <<<grid, block, 0, stream>>>(
-                              out.mutable_data_ptr<scalar_out_t>(),
-                              scales.mutable_data_ptr<float>(),
-                              input.const_data_ptr<scalar_in_t>(),
-                              scale_ub.has_value()
-                                  ? scale_ub->const_data_ptr<float>()
-                                  : nullptr,
-                              hidden_size);
+                      vllm::act_and_mul_per_block_quant_kernel<
+                          scalar_in_t, scalar_out_t, transpose_scale, gs,
+                          kGeluTanh><<<grid, block, 0, stream>>>(
+                          out.mutable_data_ptr<scalar_out_t>(),
+                          scales.mutable_data_ptr<float>(),
+                          input.const_data_ptr<scalar_in_t>(),
+                          scale_ub.has_value()
+                              ? scale_ub->const_data_ptr<float>()
+                              : nullptr,
+                          hidden_size);
                     });
               });
             });
       });
+}
+
+void silu_and_mul_per_block_quant(torch::stable::Tensor& out,
+                                  torch::stable::Tensor const& input,
+                                  torch::stable::Tensor& scales,
+                                  int64_t group_size,
+                                  std::optional<torch::stable::Tensor> scale_ub,
+                                  bool is_scale_transposed) {
+  act_and_mul_per_block_quant<false>(out, input, scales, group_size, scale_ub,
+                                     is_scale_transposed);
+}
+
+void gelu_tanh_and_mul_per_block_quant(
+    torch::stable::Tensor& out, torch::stable::Tensor const& input,
+    torch::stable::Tensor& scales, int64_t group_size,
+    std::optional<torch::stable::Tensor> scale_ub, bool is_scale_transposed) {
+  act_and_mul_per_block_quant<true>(out, input, scales, group_size, scale_ub,
+                                    is_scale_transposed);
 }

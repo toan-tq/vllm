@@ -253,6 +253,12 @@ Supported quantization scheme/hardware combinations:
 - NVFP4 dynamic: CUDA sm100+ only with FlashInfer
 - FP8 per-token-group (128): ROCm AITER only
 
+The FP8 static per-tensor and per-group kernels also exist for `gelu_tanh_and_mul`
+(GeGLU with the tanh approximation, used by Gemma 2/3/4), so this pass matches both
+activations. The Gemma dense MLPs also call `maybe_fused_act_quant`, so the manual
+fusion applies to them as it does to Llama (static per-tensor consumers only, since
+no block-FP8 GEMM kernel advertises a consumable input quant key).
+
 **Code locations.**
 
 - Pass: [`vllm/compilation/passes/fusion/act_quant_fusion.py`](https://github.com/vllm-project/vllm/blob/main/vllm/compilation/passes/fusion/act_quant_fusion.py)

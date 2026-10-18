@@ -240,6 +240,11 @@ void silu_and_mul_per_block_quant(torch::stable::Tensor& out,
                                   std::optional<torch::stable::Tensor> scale_ub,
                                   bool is_scale_transposed);
 
+void gelu_tanh_and_mul_per_block_quant(
+    torch::stable::Tensor& out, torch::stable::Tensor const& input,
+    torch::stable::Tensor& scales, int64_t group_size,
+    std::optional<torch::stable::Tensor> scale_ub, bool is_scale_transposed);
+
 // Positional encoding kernels (shared CUDA/ROCm)
 void rotary_embedding(torch::stable::Tensor& positions,
                       torch::stable::Tensor& query,
@@ -588,6 +593,10 @@ void silu_and_mul_clamp(torch::stable::Tensor& out,
 void silu_and_mul_quant(torch::stable::Tensor& out,
                         torch::stable::Tensor& input,
                         torch::stable::Tensor& scale);
+
+void gelu_tanh_and_mul_quant(torch::stable::Tensor& out,
+                             torch::stable::Tensor& input,
+                             torch::stable::Tensor& scale);
 
 void persistent_masked_m_silu_mul_quant(
     const torch::stable::Tensor& input,              // (E, T, 2*H)

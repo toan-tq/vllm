@@ -38,6 +38,18 @@ __device__ __forceinline__ T silu_kernel(const T& x) {
   return (T)(((float)x) / (1.0f + expf((float)-x)));
 }
 
+template <typename T>
+__device__ __forceinline__ T gelu_tanh_kernel(const T& x) {
+  // PyTorch GELU with the 'tanh' approximation; same math as the unfused
+  // gelu_tanh_and_mul kernel in activation_kernels.cu.
+  const float f = (float)x;
+  constexpr float BETA = M_SQRT2 * M_2_SQRTPI * 0.5f;
+  constexpr float KAPPA = 0.044715;
+  const float x_cube = f * f * f;
+  const float inner = BETA * (f + KAPPA * x_cube);
+  return (T)(0.5f * f * (1.0f + ::tanhf(inner)));
+}
+
 // Activation and gating kernel template.
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&),
           typename fp8_type>
@@ -601,6 +613,20 @@ void silu_and_mul_quant(torch::stable::Tensor& out,    // [..., d]
       "Input must be FP16 or BF16");
   STD_TORCH_CHECK(input.size(-1) % 2 == 0);
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel);
+}
+
+void gelu_tanh_and_mul_quant(torch::stable::Tensor& out,    // [..., d]
+                             torch::stable::Tensor& input,  // [..., 2 * d]
+                             torch::stable::Tensor& scale) {
+  STD_TORCH_CHECK(
+      out.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn ||
+      out.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fnuz);
+  STD_TORCH_CHECK(
+      input.scalar_type() == torch::headeronly::ScalarType::Half ||
+          input.scalar_type() == torch::headeronly::ScalarType::BFloat16,
+      "Input must be FP16 or BF16");
+  STD_TORCH_CHECK(input.size(-1) % 2 == 0);
+  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel);
 }
 
 void persistent_masked_m_silu_mul_quant(
