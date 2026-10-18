@@ -14,10 +14,19 @@ IS_ROCM = current_platform.is_rocm()
 """ROCm needs shape normalization before calling some vLLM C kernels."""
 GPGPU_DEVICE = CUDA_ALIKE or current_platform.is_xpu()
 
+
+def _weight_dtype_supported(x: Tensor, weight: Tensor | None) -> bool:
+    """The CUDA/ROCm kernels also accept an fp32 weight on fp16/bf16 activations
+    (GemmaRMSNorm-style `1 + w` weights); the XPU kernels require a match."""
+    if weight is None or weight.dtype == x.dtype:
+        return True
+    return CUDA_ALIKE and weight.dtype == torch.float32
+
+
 rms_no_var_size = lambda x, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None and _weight_dtype_supported(x, weight)
 )
-"""vLLM kernel requires no variance_size override and matching input/weight dtype."""
+"""vLLM kernel requires no variance_size override and a supported weight dtype."""
 
 
 @ir.ops.rms_norm.register_impl(
@@ -45,10 +54,10 @@ def rms_norm(
 
 
 rms_add_no_var_size = lambda x, x_residual, weight, epsilon, variance_size=None: (
-    variance_size is None and (weight is None or weight.dtype == x.dtype)
+    variance_size is None and _weight_dtype_supported(x, weight)
 )
 """vLLM Kernel does not support variance_size parameter and requires
-matching input/weight dtype."""
+a supported weight dtype."""
 
 
 @ir.ops.fused_add_rms_norm.register_impl(

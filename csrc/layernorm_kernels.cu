@@ -6,12 +6,14 @@
 #include "core/utils.hpp"
 #include "type_convert.cuh"
 #include "dispatch_utils.h"
+#include "layernorm_weight.cuh"
 #include "quantization/vectorization_utils.cuh"
 
 namespace vllm {
 
 // TODO(woosuk): Further optimize this kernel.
-template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HasWeight>
+template <typename scalar_t, typename weight_t, int VEC_SIZE, int NUM_DIMS,
+          bool HasWeight>
 __global__ void rms_norm_kernel(
     scalar_t* __restrict__ out,           // [..., hidden_size]
     const scalar_t* __restrict__ input,   // [..., hidden_size]
@@ -20,7 +22,7 @@ __global__ void rms_norm_kernel(
     const int64_t input_stride_d4,        // input.stride(-4)
     const int64_t input_shape_d2,         // input.size(-2)
     const int64_t input_shape_d3,         // input.size(-3)
-    const scalar_t* __restrict__ weight,  // [hidden_size] or
+    const weight_t* __restrict__ weight,  // [hidden_size] or
                                           // [num_groups, hidden_size];
                                           // null if !HasWeight
     const int64_t weight_stride,          // 0 or weight.stride(0)
@@ -28,7 +30,7 @@ __global__ void rms_norm_kernel(
   __shared__ float s_variance;
   float variance = 0.0f;
   const scalar_t* input_row;
-  const scalar_t* weight_row;
+  const weight_t* weight_row;
   if constexpr (NUM_DIMS == 2) {
     // 2D for layernorm normal case [batch_size, hidden]
     input_row = input + blockIdx.x * input_stride_d2;
@@ -76,21 +78,19 @@ __global__ void rms_norm_kernel(
 
   scalar_t* out_row = out + blockIdx.x * hidden_size;
   auto* v_in = reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(input_row);
-  auto* v_w = reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(weight_row);
   auto* v_out = reinterpret_cast<vec_n_t<scalar_t, VEC_SIZE>*>(out_row);
   for (int i = threadIdx.x; i < hidden_size / VEC_SIZE; i += blockDim.x) {
     vec_n_t<scalar_t, VEC_SIZE> dst;
     vec_n_t<scalar_t, VEC_SIZE> src1 = v_in[i];
-    vec_n_t<scalar_t, VEC_SIZE> src2;
+    [[maybe_unused]] float w[VEC_SIZE];
     if constexpr (HasWeight) {
-      src2 = v_w[i];
+      load_weight_as_float<weight_t, VEC_SIZE>(weight_row + i * VEC_SIZE, w);
     }
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; j++) {
       float x = static_cast<float>(src1.val[j]);
       if constexpr (HasWeight) {
-        float w = static_cast<float>(src2.val[j]);
-        dst.val[j] = static_cast<scalar_t>(x * s_variance * w);
+        dst.val[j] = static_cast<scalar_t>(x * s_variance * w[j]);
       } else {
         dst.val[j] = static_cast<scalar_t>(x * s_variance);
       }
@@ -103,13 +103,13 @@ __global__ void rms_norm_kernel(
    Additional optimizations we can make in this case are
    packed and vectorized operations, which help with the
    memory latency bottleneck. */
-template <typename scalar_t, int width, bool HasWeight>
+template <typename scalar_t, typename weight_t, int width, bool HasWeight>
 __global__ std::enable_if_t<(width > 0) && _typeConvert<scalar_t>::exists>
 fused_add_rms_norm_kernel(
     scalar_t* __restrict__ input,  // [..., hidden_size]
     const int64_t input_stride,
     scalar_t* __restrict__ residual,      // [..., hidden_size]
-    const scalar_t* __restrict__ weight,  // [hidden_size], null if !HasWeight
+    const weight_t* __restrict__ weight,  // [hidden_size], null if !HasWeight
     const float epsilon, const int num_tokens, const int hidden_size,
     const int64_t residual_stride) {
   // Sanity checks on our vector struct and type-punned pointer arithmetic
@@ -127,8 +127,6 @@ fused_add_rms_norm_kernel(
       reinterpret_cast<_f16Vec<scalar_t, width>*>(input);
   auto* __restrict__ residual_v =
       reinterpret_cast<_f16Vec<scalar_t, width>*>(residual);
-  auto* __restrict__ weight_v =
-      reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
 
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int64_t id = blockIdx.x * residual_stride / width + idx;
@@ -155,12 +153,12 @@ fused_add_rms_norm_kernel(
     _f16Vec<scalar_t, width> out;
     using Converter = _typeConvert<scalar_t>;
     if constexpr (HasWeight) {
-      _f16Vec<scalar_t, width> w = weight_v[idx];
+      float wf[width];
+      load_weight_as_float<weight_t, width>(weight + idx * width, wf);
 #pragma unroll
       for (int j = 0; j < width; ++j) {
         float x = Converter::convert(res.data[j]);
-        float wf = Converter::convert(w.data[j]);
-        out.data[j] = Converter::convert(x * s_variance * wf);
+        out.data[j] = Converter::convert(x * s_variance * wf[j]);
       }
     } else {
 #pragma unroll
@@ -176,13 +174,13 @@ fused_add_rms_norm_kernel(
 /* Generic fused_add_rms_norm_kernel
    The width field is not used here but necessary for other specializations.
  */
-template <typename scalar_t, int width, bool HasWeight>
+template <typename scalar_t, typename weight_t, int width, bool HasWeight>
 __global__ std::enable_if_t<(width == 0) || !_typeConvert<scalar_t>::exists>
 fused_add_rms_norm_kernel(
     scalar_t* __restrict__ input,  // [..., hidden_size]
     const int64_t input_stride,
     scalar_t* __restrict__ residual,      // [..., hidden_size]
-    const scalar_t* __restrict__ weight,  // [hidden_size], null if !HasWeight
+    const weight_t* __restrict__ weight,  // [hidden_size], null if !HasWeight
     const float epsilon, const int num_tokens, const int hidden_size,
     const int64_t residual_stride) {
   __shared__ float s_variance;
@@ -228,6 +226,10 @@ void rms_norm(torch::stable::Tensor& out,    // [..., hidden_size]
   STD_TORCH_CHECK(input.stride(-1) == 1);
   int64_t weight_stride = 0;
   if (weight.has_value()) {
+    STD_TORCH_CHECK(
+        weight->scalar_type() == input.scalar_type() ||
+            weight->scalar_type() == torch::headeronly::ScalarType::Float,
+        "rms_norm weight must match the input dtype or be float32");
     STD_TORCH_CHECK(weight->is_contiguous());
     if (weight->dim() == 1) {
       STD_TORCH_CHECK(weight->size(0) == input.size(-1));
@@ -259,56 +261,62 @@ void rms_norm(torch::stable::Tensor& out,    // [..., hidden_size]
       input.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
   const bool has_weight = weight.has_value();
+  const auto weight_type =
+      has_weight ? weight->scalar_type() : input.scalar_type();
   VLLM_STABLE_DISPATCH_RANK234(num_dims, [&] {
     VLLM_STABLE_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "rms_norm_kernel", [&] {
-          const scalar_t* weight_ptr =
-              has_weight ? weight->const_data_ptr<scalar_t>() : nullptr;
           const int calculated_vec_size =
               std::gcd(16 / sizeof(scalar_t), hidden_size);
           const int block_size =
               std::min(hidden_size / calculated_vec_size, max_block_size);
           dim3 block(block_size);
-          VLLM_STABLE_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
-            if (has_weight) {
-              vllm::rms_norm_kernel<scalar_t, vec_size, tensor_rank, true>
-                  <<<grid, block, 0, stream>>>(
-                      out.mutable_data_ptr<scalar_t>(),
-                      input.const_data_ptr<scalar_t>(), input_stride_d2,
-                      input_stride_d3, input_stride_d4, input_shape_d2,
-                      input_shape_d3, weight_ptr, weight_stride, epsilon,
-                      num_tokens, hidden_size);
-            } else {
-              vllm::rms_norm_kernel<scalar_t, vec_size, tensor_rank, false>
-                  <<<grid, block, 0, stream>>>(
-                      out.mutable_data_ptr<scalar_t>(),
-                      input.const_data_ptr<scalar_t>(), input_stride_d2,
-                      input_stride_d3, input_stride_d4, input_shape_d2,
-                      input_shape_d3, weight_ptr, /*weight_stride=*/0, epsilon,
-                      num_tokens, hidden_size);
-            }
+          VLLM_STABLE_DISPATCH_NORM_WEIGHT_TYPE(scalar_t, weight_type, [&] {
+            const weight_t* weight_ptr =
+                has_weight ? weight->const_data_ptr<weight_t>() : nullptr;
+            VLLM_STABLE_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
+              if (has_weight) {
+                vllm::rms_norm_kernel<scalar_t, weight_t, vec_size, tensor_rank,
+                                      true><<<grid, block, 0, stream>>>(
+                    out.mutable_data_ptr<scalar_t>(),
+                    input.const_data_ptr<scalar_t>(), input_stride_d2,
+                    input_stride_d3, input_stride_d4, input_shape_d2,
+                    input_shape_d3, weight_ptr, weight_stride, epsilon,
+                    num_tokens, hidden_size);
+              } else {
+                vllm::rms_norm_kernel<scalar_t, weight_t, vec_size, tensor_rank,
+                                      false><<<grid, block, 0, stream>>>(
+                    out.mutable_data_ptr<scalar_t>(),
+                    input.const_data_ptr<scalar_t>(), input_stride_d2,
+                    input_stride_d3, input_stride_d4, input_shape_d2,
+                    input_shape_d3, weight_ptr, /*weight_stride=*/0, epsilon,
+                    num_tokens, hidden_size);
+              }
+            });
           });
         });
   });
 }
 
-#define LAUNCH_FUSED_ADD_RMS_NORM(width, has_weight)                       \
-  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                     \
-      input.scalar_type(), "fused_add_rms_norm_kernel", [&] {              \
-        if (has_weight) {                                                  \
-          vllm::fused_add_rms_norm_kernel<scalar_t, width, true>           \
-              <<<grid, block, 0, stream>>>(                                \
-                  input.mutable_data_ptr<scalar_t>(), input_stride,        \
-                  residual.mutable_data_ptr<scalar_t>(),                   \
-                  weight->const_data_ptr<scalar_t>(), epsilon, num_tokens, \
-                  hidden_size, residual_stride);                           \
-        } else {                                                           \
-          vllm::fused_add_rms_norm_kernel<scalar_t, width, false>          \
-              <<<grid, block, 0, stream>>>(                                \
-                  input.mutable_data_ptr<scalar_t>(), input_stride,        \
-                  residual.mutable_data_ptr<scalar_t>(), nullptr, epsilon, \
-                  num_tokens, hidden_size, residual_stride);               \
-        }                                                                  \
+#define LAUNCH_FUSED_ADD_RMS_NORM(width, has_weight)                         \
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                       \
+      input.scalar_type(), "fused_add_rms_norm_kernel", [&] {                \
+        if (has_weight) {                                                    \
+          VLLM_STABLE_DISPATCH_NORM_WEIGHT_TYPE(scalar_t, weight_type, [&] { \
+            vllm::fused_add_rms_norm_kernel<scalar_t, weight_t, width, true> \
+                <<<grid, block, 0, stream>>>(                                \
+                    input.mutable_data_ptr<scalar_t>(), input_stride,        \
+                    residual.mutable_data_ptr<scalar_t>(),                   \
+                    weight->const_data_ptr<weight_t>(), epsilon, num_tokens, \
+                    hidden_size, residual_stride);                           \
+          });                                                                \
+        } else {                                                             \
+          vllm::fused_add_rms_norm_kernel<scalar_t, scalar_t, width, false>  \
+              <<<grid, block, 0, stream>>>(                                  \
+                  input.mutable_data_ptr<scalar_t>(), input_stride,          \
+                  residual.mutable_data_ptr<scalar_t>(), nullptr, epsilon,   \
+                  num_tokens, hidden_size, residual_stride);                 \
+        }                                                                    \
       });
 
 void fused_add_rms_norm(torch::stable::Tensor& input,     // [..., hidden_size]
@@ -318,9 +326,14 @@ void fused_add_rms_norm(torch::stable::Tensor& input,     // [..., hidden_size]
   STD_TORCH_CHECK(input.scalar_type() == residual.scalar_type());
   STD_TORCH_CHECK(residual.stride(-1) == 1);
   if (weight.has_value()) {
-    STD_TORCH_CHECK(weight->scalar_type() == input.scalar_type());
+    STD_TORCH_CHECK(
+        weight->scalar_type() == input.scalar_type() ||
+            weight->scalar_type() == torch::headeronly::ScalarType::Float,
+        "fused_add_rms_norm weight must match the input dtype or be float32");
     STD_TORCH_CHECK(weight->is_contiguous());
   }
+  const auto weight_type =
+      weight.has_value() ? weight->scalar_type() : input.scalar_type();
   int hidden_size = input.size(-1);
   int64_t input_stride = input.stride(-2);
   int64_t residual_stride = residual.stride(-2);

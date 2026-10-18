@@ -46,7 +46,7 @@ from vllm.model_executor.kernels.linear import (
     TritonFp8BlockScaledMMKernel,
     _KernelT,
 )
-from vllm.model_executor.layers.layernorm import RMSNorm, RMSNormGated
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     create_fp8_quant_key,
@@ -124,6 +124,7 @@ class TestModel(torch.nn.Module):
         dtype: torch.dtype,
         use_aiter_fusion: bool = False,
         use_aiter_quant: bool = False,
+        norm_cls: type[RMSNorm] | type[GemmaRMSNorm] = RMSNorm,
         *args,
         **kwargs,
     ):
@@ -132,7 +133,7 @@ class TestModel(torch.nn.Module):
         self.group_shape = group_shape
         self.use_aiter_quant_op = use_aiter_quant
         self.use_aiter_fusion = use_aiter_fusion
-        self.norm = [RMSNorm(hidden_size, eps) for _ in range(4)]
+        self.norm = [norm_cls(hidden_size, eps) for _ in range(4)]
         self.enable_rms_norm_custom_op = self.norm[0].enabled()
 
         # Determine if blockwise based on group_shape
@@ -425,6 +426,184 @@ def test_fusion_rmsnorm_quant(
         backend.check_before_ops(
             model.ops_in_model_before_partial(), fully_replaced=False
         )
+
+
+# GemmaRMSNorm applies an fp32 `1 + w` weight to fp16/bf16 activations, so its
+# graph carries a mixed-dtype rms_norm. One kernel per quant scheme is enough.
+FP32_WEIGHT_KERNEL_GROUPSHAPE_COMBINATIONS = (
+    [
+        (CutlassFP8ScaledMMLinearKernel, GroupShape.PER_TENSOR),
+        (CutlassFP8ScaledMMLinearKernel, GroupShape.PER_TOKEN),
+        (TritonFp8BlockScaledMMKernel, GroupShape(1, 128)),
+    ]
+    if current_platform.is_cuda()
+    else [
+        (ROCmFP8ScaledMMLinearKernel, GroupShape.PER_TENSOR),
+        (RowWiseTorchFP8ScaledMMLinearKernel, GroupShape.PER_TOKEN),
+        (TritonFp8BlockScaledMMKernel, GroupShape(1, 128)),
+    ]
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [256])
+@pytest.mark.parametrize("num_tokens", [257])
+@pytest.mark.parametrize("eps", [1e-6])
+@pytest.mark.parametrize(
+    "kernel_groupshape", FP32_WEIGHT_KERNEL_GROUPSHAPE_COMBINATIONS
+)
+@pytest.mark.parametrize("enable_quant_fp8_custom_op", [True, False])
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Only test on CUDA and ROCm"
+)
+def test_fusion_rmsnorm_quant_fp32_weight(
+    dtype,
+    hidden_size,
+    num_tokens,
+    eps,
+    kernel_groupshape,
+    enable_quant_fp8_custom_op,
+):
+    """RMSNorm+quant fusion must also fire for GemmaRMSNorm-style norms, whose
+    fp32 weight differs from the activation dtype."""
+    force_kernel, group_shape = kernel_groupshape
+
+    if not enable_quant_fp8_custom_op and group_shape.is_per_group():
+        pytest.skip("Unsupported unwrapped quant fp8 op for blockwise quantization")
+
+    custom_ops = ["+rms_norm"]
+    if enable_quant_fp8_custom_op:
+        custom_ops.append("+quant_fp8")
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=custom_ops,
+            pass_config=PassConfig(
+                fuse_norm_quant=True, fuse_act_quant=True, eliminate_noops=True
+            ),
+        ),
+    )
+
+    with (
+        vllm.config.set_current_vllm_config(vllm_config),
+        vllm_config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        torch.set_default_device("cuda")
+        torch.set_default_dtype(dtype)
+        torch.manual_seed(1)
+
+        fusion_pass = RMSNormQuantFusionPass(vllm_config)
+
+        model = TestModel(
+            hidden_size=hidden_size,
+            eps=eps,
+            force_kernel=force_kernel,
+            group_shape=group_shape,
+            dtype=dtype,
+            norm_cls=GemmaRMSNorm,
+        )
+        # Non-trivial weight (~Gemma range) so (1 + w) exercises the scale path.
+        for norm in model.norm:
+            norm.weight.data.normal_(mean=0.0, std=0.1)
+        if any(
+            type(layer.kernel) is not force_kernel for layer in model.fp8_linear_layers
+        ):
+            pytest.skip(f"{force_kernel.__name__} is not supported on this platform")
+
+        _run_fusion_test(
+            model, fusion_pass, vllm_config, dtype, hidden_size, num_tokens
+        )
+
+
+class _Fp16WeightGemmaRMSNorm(GemmaRMSNorm):
+    """GemmaRMSNorm whose `1 + w` weight is fp16, so on bf16 activations it
+    matches neither the activation dtype nor the fp32 case the kernels take."""
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        weight = (self.weight.float() + 1.0).to(torch.float16)
+        if residual is None:
+            return vllm.ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return vllm.ir.ops.fused_add_rms_norm(
+            x, residual, weight, self.variance_epsilon
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [256])
+@pytest.mark.parametrize("num_tokens", [257])
+@pytest.mark.parametrize("eps", [1e-6])
+@pytest.mark.parametrize(
+    "kernel_groupshape", FP32_WEIGHT_KERNEL_GROUPSHAPE_COMBINATIONS
+)
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Only test on CUDA and ROCm"
+)
+def test_fusion_rmsnorm_quant_unsupported_weight_dtype_skips(
+    dtype,
+    hidden_size,
+    num_tokens,
+    eps,
+    kernel_groupshape,
+):
+    """A weight dtype the fused kernels do not take (fp16 weight on bf16
+    activations) must leave the graph unfused and still run, rather than reach
+    a kernel that raises."""
+    force_kernel, group_shape = kernel_groupshape
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=["+rms_norm", "+quant_fp8"],
+            pass_config=PassConfig(
+                fuse_norm_quant=True, fuse_act_quant=True, eliminate_noops=True
+            ),
+        ),
+    )
+
+    with (
+        vllm.config.set_current_vllm_config(vllm_config),
+        vllm_config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        torch.set_default_device("cuda")
+        torch.set_default_dtype(dtype)
+        torch.manual_seed(1)
+
+        fusion_pass = RMSNormQuantFusionPass(vllm_config)
+
+        model = TestModel(
+            hidden_size=hidden_size,
+            eps=eps,
+            force_kernel=force_kernel,
+            group_shape=group_shape,
+            dtype=dtype,
+            norm_cls=_Fp16WeightGemmaRMSNorm,
+        )
+        if any(
+            type(layer.kernel) is not force_kernel for layer in model.fp8_linear_layers
+        ):
+            pytest.skip(f"{force_kernel.__name__} is not supported on this platform")
+
+        backend = TestBackend(
+            NoOpEliminationPass(vllm_config), fusion_pass, PostCleanupPass(vllm_config)
+        )
+        x = torch.rand(num_tokens, hidden_size)
+        torch._dynamo.mark_dynamic(x, 0)
+        result = torch.compile(model, backend=backend)(x)
+
+        assert fusion_pass.matched_count == 0
+        assert result.dtype == dtype
+        for op in model.ops_in_model_after():
+            assert backend.op_count(op) == 0, f"{op.name()} fused despite guard"
+        # The unfused rms_norm and quant ops are still in the graph.
+        for op in model.ops_in_model_before_partial() + model.ops_in_model_before():
+            assert backend.op_count(op) > 0, f"{op.name()} missing from graph"
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

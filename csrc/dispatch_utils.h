@@ -134,6 +134,18 @@
     __VA_ARGS__();                                       \
   }
 
+// RMSNorm weight dtype dispatch: the weight either matches the activation
+// dtype INPUT_T or is float32 (GemmaRMSNorm-style fp32 `1 + w` weights).
+// Callers validate WEIGHT_TYPE before dispatching.
+#define VLLM_STABLE_DISPATCH_NORM_WEIGHT_TYPE(INPUT_T, WEIGHT_TYPE, ...) \
+  if ((WEIGHT_TYPE) == torch::headeronly::ScalarType::Float) {           \
+    using weight_t = float;                                              \
+    __VA_ARGS__();                                                       \
+  } else {                                                               \
+    using weight_t = INPUT_T;                                            \
+    __VA_ARGS__();                                                       \
+  }
+
 // Vec size dispatch (pure C++ switch, no ATen dependency)
 #define VLLM_STABLE_DISPATCH_VEC_SIZE(VEC_SIZE, ...) \
   switch (VEC_SIZE) {                                \

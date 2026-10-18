@@ -111,10 +111,8 @@ if (
         )
 
 
-# TODO: extend rmsnorm quant kernels to support mixed input/weight dtypes,
-# and remove this check.
-def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
-    """Prevent fusion when rms_norm input and weight dtypes differ."""
+def _rms_norm_dtypes(match: pm.Match) -> tuple[torch.dtype, torch.dtype] | None:
+    """Return (input dtype, weight dtype) of the matched rms_norm node, if any."""
     for node in match.nodes:
         if node.target == _RMS_NORM_OP:
             # rms_norm(x, weight, epsilon, variance_size)
@@ -125,8 +123,38 @@ def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
         else:
             continue
         if isinstance(x, fx.Node) and isinstance(weight, fx.Node):
-            return x.meta["val"].dtype == weight.meta["val"].dtype
-    return True
+            return x.meta["val"].dtype, weight.meta["val"].dtype
+    return None
+
+
+def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
+    """Prevent fusion when rms_norm input and weight dtypes differ.
+
+    Used by the FlashInfer NVFP4 pattern and the all-reduce fusions, whose
+    kernels require matching dtypes.
+    """
+    dtypes = _rms_norm_dtypes(match)
+    return dtypes is None or dtypes[0] == dtypes[1]
+
+
+def _rms_weight_dtype_supported(match: pm.Match) -> bool:
+    """Prevent fusion unless the vLLM RMSNorm+quant kernels take the weight dtype.
+
+    They accept a weight matching the input dtype or, on CUDA/ROCm, an fp32
+    weight on fp16/bf16 activations (GemmaRMSNorm-style `1 + w` weights). Any
+    other mix keeps the unfused path instead of failing inside the kernel.
+    """
+    dtypes = _rms_norm_dtypes(match)
+    if dtypes is None:
+        return True
+    x_dtype, weight_dtype = dtypes
+    if x_dtype == weight_dtype:
+        return True
+    return (
+        current_platform.is_cuda_alike()
+        and weight_dtype == torch.float32
+        and x_dtype in (torch.float16, torch.bfloat16)
+    )
 
 
 def empty_bf16(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -282,7 +310,7 @@ class RMSNormStaticQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_rms_weight_dtype_supported,
         )
 
 
@@ -349,7 +377,7 @@ class FusedAddRMSNormStaticQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_rms_weight_dtype_supported,
         )
 
 
@@ -456,7 +484,7 @@ class FusedAddRMSNormGroupQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_rms_weight_dtype_supported,
         )
 
 
@@ -550,7 +578,7 @@ class RMSNormGroupQuantPattern(RMSNormQuantPattern):
             ],
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_rms_weight_dtype_supported,
         )
 
 
@@ -609,7 +637,7 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
             ],
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_rms_weight_dtype_supported,
         )
 
 
@@ -674,7 +702,7 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_rms_weight_dtype_supported,
         )
 
 

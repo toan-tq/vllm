@@ -131,6 +131,55 @@ def test_rms_norm_weightless(
         )
 
 
+@pytest.mark.parametrize("num_tokens", [7, 4096])
+@pytest.mark.parametrize("hidden_size", [768, 769, 5120, 8192])
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("strided_input", [False, True])
+@torch.inference_mode()
+def test_rms_norm_fp32_weight(
+    default_vllm_config,
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    device: str,
+    strided_input: bool,
+) -> None:
+    """The kernels accept an fp32 weight on fp16/bf16 activations, which is
+    what GemmaRMSNorm passes (`weight.float() + 1`), and match the native op."""
+    set_random_seed(0)
+    torch.set_default_device(device)
+    eps = 1e-6
+    weight = torch.empty(hidden_size, dtype=torch.float32).normal_(mean=1.0, std=0.1)
+    scale = 1 / (2 * hidden_size)
+    last_dim = 2 * hidden_size if strided_input else hidden_size
+    x_base = torch.randn(num_tokens, last_dim, dtype=dtype) * scale
+    x = x_base[..., :hidden_size]
+    assert x.is_contiguous() != strided_input
+
+    if add_residual:
+        residual = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+        ref_out, ref_residual = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+            x, residual.clone(), weight, eps
+        )
+        x_kernel = x_base.clone()[..., :hidden_size]
+        residual_kernel = residual.clone()
+        torch.ops._C.fused_add_rms_norm(x_kernel, residual_kernel, weight, eps)
+        torch.testing.assert_close(x_kernel, ref_out, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(residual_kernel, ref_residual, atol=1e-2, rtol=1e-2)
+        opcheck(
+            torch.ops._C.fused_add_rms_norm, (x_kernel, residual_kernel, weight, eps)
+        )
+    else:
+        ref_out = ir.ops.rms_norm.impls["native"].impl_fn(x, weight, eps)
+        out = torch.empty(x.shape, dtype=dtype)
+        torch.ops._C.rms_norm(out, x, weight, eps)
+        torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+        opcheck(torch.ops._C.rms_norm, (out, x, weight, eps))
+
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
@@ -230,6 +279,73 @@ def test_fused_rms_norm_quant(
             atol=1e-3,
             rtol=1e-3,
         )
+
+
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@torch.inference_mode()
+def test_rms_norm_rejects_other_weight_dtypes(
+    default_vllm_config, add_residual: bool
+) -> None:
+    """Only a matching or fp32 weight is accepted; other mixes raise instead of
+    silently reading the weight with the wrong element size."""
+    torch.set_default_device(CUDA_DEVICES[0])
+    x = torch.randn(4, 64, dtype=torch.float16)
+    weight = torch.ones(64, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="float32"):
+        if add_residual:
+            torch.ops._C.fused_add_rms_norm(x, torch.randn_like(x), weight, 1e-6)
+        else:
+            torch.ops._C.rms_norm(torch.empty_like(x), x, weight, 1e-6)
+
+
+@pytest.mark.parametrize("num_tokens", [7, 4096])
+@pytest.mark.parametrize("hidden_size", [768, 769, 5120])
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("quant_scale", [0.01, 1.0])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_fused_rms_norm_quant_fp32_weight(
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    quant_scale: float,
+    device: str,
+) -> None:
+    """Static FP8 RMSNorm+quant with an fp32 (GemmaRMSNorm-style) weight matches
+    the unfused native norm followed by static_scaled_fp8_quant."""
+    set_random_seed(0)
+    torch.set_default_device(device)
+    eps = 1e-6
+    weight = torch.empty(hidden_size, dtype=torch.float32).normal_(mean=1.0, std=0.1)
+    scale = 1 / (2 * hidden_size)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+    quant_scale_t = torch.tensor(quant_scale, dtype=torch.float32)
+    out_quant = torch.empty_like(x, dtype=FP8_DTYPE)
+    out_quant_fused = torch.empty_like(out_quant)
+
+    if add_residual:
+        residual = torch.randn_like(x) * scale
+        residual_fused = residual.clone()
+        ref_norm, ref_residual = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+            x, residual, weight, eps
+        )
+        torch.ops._C.fused_add_rms_norm_static_fp8_quant(
+            out_quant_fused, x.clone(), residual_fused, weight, quant_scale_t, eps
+        )
+        torch.testing.assert_close(residual_fused, ref_residual, atol=1e-2, rtol=1e-2)
+    else:
+        ref_norm = ir.ops.rms_norm.impls["native"].impl_fn(x, weight, eps)
+        torch.ops._C.rms_norm_static_fp8_quant(
+            out_quant_fused, x, weight, quant_scale_t, eps
+        )
+    torch.ops._C.static_scaled_fp8_quant(out_quant, ref_norm, quant_scale_t)
+
+    # Fused and unfused paths may land on opposite sides of an E4M3 tie for a
+    # handful of elements; bound the number of 1-ULP outliers.
+    ulp = fp8_ulp_distance(out_quant, out_quant_fused)
+    assert int(ulp.max()) <= 1
+    assert int((ulp > 0).sum().item()) <= ulp.numel() // 100_000 + 8
 
 
 @torch.inference_mode()

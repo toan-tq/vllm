@@ -228,6 +228,11 @@ Supported quantization scheme/hardware combinations:
 - FP8 dynamic per-token: CUDA & HIP kernel, AITER
 - FP8 dynamic per-token-group (128/64): CUDA & HIP kernel, AITER
 
+The CUDA & HIP kernels also accept an fp32 norm weight on fp16/bf16 activations,
+so norms that apply an fp32 `1 + w` weight (`GemmaRMSNorm`: Gemma 2/3, Qwen3-Next,
+Qwen3.5) are fused as well. The FlashInfer NVFP4 add-RMSNorm kernel still requires
+the weight and activation dtypes to match.
+
 **Code locations.**
 
 - Pass: [`vllm/compilation/passes/fusion/rms_quant_fusion.py`](https://github.com/vllm-project/vllm/blob/main/vllm/compilation/passes/fusion/rms_quant_fusion.py)

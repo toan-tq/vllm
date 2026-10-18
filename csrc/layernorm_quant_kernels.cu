@@ -14,17 +14,19 @@
 #include "quantization/w8a8/fp8/common.cuh"
 #include "type_convert.cuh"
 #include "dispatch_utils.h"
+#include "layernorm_weight.cuh"
 #include "quantization/vectorization_utils.cuh"
 
 namespace vllm {
 
 // TODO(woosuk): Further optimize this kernel.
-template <typename scalar_t, typename fp8_type, int VEC_SIZE>
+template <typename scalar_t, typename weight_t, typename fp8_type,
+          int VEC_SIZE>
 __global__ void rms_norm_static_fp8_quant_kernel(
     fp8_type* __restrict__ out,          // [..., hidden_size]
     const scalar_t* __restrict__ input,  // [..., hidden_size]
     const int input_stride,
-    const scalar_t* __restrict__ weight,  // [hidden_size]
+    const weight_t* __restrict__ weight,  // [hidden_size]
     const float* __restrict__ scale,      // [1]
     const float epsilon, const int num_tokens, const int hidden_size) {
   __shared__ float s_variance;
@@ -59,20 +61,19 @@ __global__ void rms_norm_static_fp8_quant_kernel(
   float const scale_inv = 1.0f / *scale;
 
   auto* v_in = reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(input_row);
-  auto* v_w = reinterpret_cast<const vec_n_t<scalar_t, VEC_SIZE>*>(weight);
   for (int idx = threadIdx.x; idx < hidden_size / VEC_SIZE; idx += blockDim.x) {
     vec_n_t<scalar_t, VEC_SIZE> src1 = v_in[idx];
-    vec_n_t<scalar_t, VEC_SIZE> src2 = v_w[idx];
+    float w[VEC_SIZE];
+    load_weight_as_float<weight_t, VEC_SIZE>(weight + idx * VEC_SIZE, w);
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; j++) {
       float x = static_cast<float>(src1.val[j]);
-      float w = static_cast<float>(src2.val[j]);
       // Round normalized result through scalar_t to match the precision of the
       // unfused composite (rms_norm writes scalar_t, then
       // static_scaled_fp8_quant re-loads it as float before FP8 conversion).
       // Without this round, the fused path is strictly more accurate and
       // disagrees with the composite at exact E4M3 quantization tie boundaries.
-      scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w);
+      scalar_t out_norm = static_cast<scalar_t>(x * s_variance * w[j]);
       out[blockIdx.x * hidden_size + idx * VEC_SIZE + j] =
           scaled_fp8_conversion<true, fp8_type>(static_cast<float>(out_norm),
                                                 scale_inv);
@@ -84,14 +85,14 @@ __global__ void rms_norm_static_fp8_quant_kernel(
    Additional optimizations we can make in this case are
    packed and vectorized operations, which help with the
    memory latency bottleneck. */
-template <typename scalar_t, int width, typename fp8_type>
+template <typename scalar_t, typename weight_t, int width, typename fp8_type>
 __global__ std::enable_if_t<(width > 0) && _typeConvert<scalar_t>::exists>
 fused_add_rms_norm_static_fp8_quant_kernel(
     fp8_type* __restrict__ out,    // [..., hidden_size]
     scalar_t* __restrict__ input,  // [..., hidden_size]
     const int input_stride,
     scalar_t* __restrict__ residual,      // [..., hidden_size]
-    const scalar_t* __restrict__ weight,  // [hidden_size]
+    const weight_t* __restrict__ weight,  // [hidden_size]
     const float* __restrict__ scale,      // [1]
     const float epsilon, const int num_tokens, const int hidden_size) {
   // Sanity checks on our vector struct and type-punned pointer arithmetic
@@ -109,8 +110,6 @@ fused_add_rms_norm_static_fp8_quant_kernel(
       reinterpret_cast<_f16Vec<scalar_t, width>*>(input);
   auto* __restrict__ residual_v =
       reinterpret_cast<_f16Vec<scalar_t, width>*>(residual);
-  auto* __restrict__ weight_v =
-      reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
 
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int stride_id = blockIdx.x * vec_input_stride + idx;
@@ -136,18 +135,18 @@ fused_add_rms_norm_static_fp8_quant_kernel(
   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
     int id = blockIdx.x * vec_hidden_size + idx;
     _f16Vec<scalar_t, width> res = residual_v[id];
-    _f16Vec<scalar_t, width> w = weight_v[idx];
+    float wf[width];
+    load_weight_as_float<weight_t, width>(weight + idx * width, wf);
     using Converter = _typeConvert<scalar_t>;
     using HipT = typename Converter::hip_type;
 #pragma unroll
     for (int i = 0; i < width; ++i) {
       float x = Converter::convert(res.data[i]);
-      float wf = Converter::convert(w.data[i]);
       // See note in rms_norm_static_fp8_quant_kernel: round through scalar_t
       // to match the unfused composite path at FP8 boundaries. We use the
       // backend's hip_type for the intermediate since c10::Half/BFloat16 has
       // ambiguous conversions on CUDA and no implicit conversion on ROCm.
-      HipT out_norm_h = Converter::convert(x * s_variance * wf);
+      HipT out_norm_h = Converter::convert(x * s_variance * wf[i]);
       out[id * width + i] = scaled_fp8_conversion<true, fp8_type>(
           Converter::convert(out_norm_h), scale_inv);
     }
@@ -157,14 +156,14 @@ fused_add_rms_norm_static_fp8_quant_kernel(
 /* Generic fused_add_rms_norm_kernel
    The width field is not used here but necessary for other specializations.
  */
-template <typename scalar_t, int width, typename fp8_type>
+template <typename scalar_t, typename weight_t, int width, typename fp8_type>
 __global__ std::enable_if_t<(width == 0) || !_typeConvert<scalar_t>::exists>
 fused_add_rms_norm_static_fp8_quant_kernel(
     fp8_type* __restrict__ out,    // [..., hidden_size]
     scalar_t* __restrict__ input,  // [..., hidden_size]
     const int input_stride,
     scalar_t* __restrict__ residual,      // [..., hidden_size]
-    const scalar_t* __restrict__ weight,  // [hidden_size]
+    const weight_t* __restrict__ weight,  // [hidden_size]
     const float* __restrict__ scale,      // [1]
     const float epsilon, const int num_tokens, const int hidden_size) {
   __shared__ float s_variance;
@@ -210,6 +209,11 @@ void rms_norm_static_fp8_quant(
     torch::stable::Tensor& scale,   // [1]
     double epsilon) {
   STD_TORCH_CHECK(out.is_contiguous());
+  STD_TORCH_CHECK(
+      weight.scalar_type() == input.scalar_type() ||
+          weight.scalar_type() == torch::headeronly::ScalarType::Float,
+      "rms_norm_static_fp8_quant weight must match the input dtype or be "
+      "float32");
   int hidden_size = input.size(-1);
   int input_stride = input.stride(-2);
   int num_tokens = input.numel() / hidden_size;
@@ -231,35 +235,41 @@ void rms_norm_static_fp8_quant(
               const int block_size =
                   std::min(hidden_size / calculated_vec_size, max_block_size);
               dim3 block(block_size);
-              VLLM_STABLE_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
-                vllm::rms_norm_static_fp8_quant_kernel<scalar_t, fp8_t,
-                                                       vec_size>
-                    <<<grid, block, 0, stream>>>(
-                        out.mutable_data_ptr<fp8_t>(),
-                        input.const_data_ptr<scalar_t>(), input_stride,
-                        weight.const_data_ptr<scalar_t>(),
-                        scale.const_data_ptr<float>(), epsilon, num_tokens,
-                        hidden_size);
-              });
+              VLLM_STABLE_DISPATCH_NORM_WEIGHT_TYPE(
+                  scalar_t, weight.scalar_type(), [&] {
+                    VLLM_STABLE_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
+                      vllm::rms_norm_static_fp8_quant_kernel<scalar_t, weight_t,
+                                                             fp8_t, vec_size>
+                          <<<grid, block, 0, stream>>>(
+                              out.mutable_data_ptr<fp8_t>(),
+                              input.const_data_ptr<scalar_t>(), input_stride,
+                              weight.const_data_ptr<weight_t>(),
+                              scale.const_data_ptr<float>(), epsilon,
+                              num_tokens, hidden_size);
+                    });
+                  });
             });
       });
 }
 
-#define LAUNCH_FUSED_ADD_RMS_NORM(width)                                     \
-  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                       \
-      input.scalar_type(), "fused_add_rms_norm_kernel_scalar_type", [&] {    \
-        VLLM_STABLE_DISPATCH_FP8_TYPES(                                      \
-            out.scalar_type(), "fused_add_rms_norm_kernel_fp8_type", [&] {   \
-              vllm::fused_add_rms_norm_static_fp8_quant_kernel<scalar_t,     \
-                                                               width, fp8_t> \
-                  <<<grid, block, 0, stream>>>(                              \
-                      out.mutable_data_ptr<fp8_t>(),                         \
-                      input.mutable_data_ptr<scalar_t>(), input_stride,      \
-                      residual.mutable_data_ptr<scalar_t>(),                 \
-                      weight.const_data_ptr<scalar_t>(),                     \
-                      scale.const_data_ptr<float>(), epsilon, num_tokens,    \
-                      hidden_size);                                          \
-            });                                                              \
+#define LAUNCH_FUSED_ADD_RMS_NORM(width)                                      \
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                        \
+      input.scalar_type(), "fused_add_rms_norm_kernel_scalar_type", [&] {     \
+        VLLM_STABLE_DISPATCH_FP8_TYPES(                                       \
+            out.scalar_type(), "fused_add_rms_norm_kernel_fp8_type", [&] {    \
+              VLLM_STABLE_DISPATCH_NORM_WEIGHT_TYPE(                          \
+                  scalar_t, weight.scalar_type(), [&] {                       \
+                    vllm::fused_add_rms_norm_static_fp8_quant_kernel<         \
+                        scalar_t, weight_t, width, fp8_t>                     \
+                        <<<grid, block, 0, stream>>>(                         \
+                            out.mutable_data_ptr<fp8_t>(),                    \
+                            input.mutable_data_ptr<scalar_t>(), input_stride, \
+                            residual.mutable_data_ptr<scalar_t>(),            \
+                            weight.const_data_ptr<weight_t>(),                \
+                            scale.const_data_ptr<float>(), epsilon,           \
+                            num_tokens, hidden_size);                         \
+                  });                                                         \
+            });                                                               \
       });
 void fused_add_rms_norm_static_fp8_quant(
     torch::stable::Tensor& out,       // [..., hidden_size],
@@ -271,7 +281,11 @@ void fused_add_rms_norm_static_fp8_quant(
   STD_TORCH_CHECK(out.is_contiguous());
   STD_TORCH_CHECK(residual.is_contiguous());
   STD_TORCH_CHECK(residual.scalar_type() == input.scalar_type());
-  STD_TORCH_CHECK(weight.scalar_type() == input.scalar_type());
+  STD_TORCH_CHECK(
+      weight.scalar_type() == input.scalar_type() ||
+          weight.scalar_type() == torch::headeronly::ScalarType::Float,
+      "fused_add_rms_norm_static_fp8_quant weight must match the input dtype "
+      "or be float32");
   int hidden_size = input.size(-1);
   int input_stride = input.stride(-2);
   int num_tokens = input.numel() / hidden_size;

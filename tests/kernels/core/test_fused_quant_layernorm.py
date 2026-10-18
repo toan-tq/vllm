@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 from tests.kernels.utils import fp8_allclose, fp8_ulp_distance, opcheck
+from vllm import ir
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -424,3 +425,84 @@ def test_rms_norm(
                 True,  # is_scale_transposed
             ),
         )
+
+
+class _NativeNorm:
+    """Reference norm that always runs the native IR impl, so the fp32-weight
+    test does not compare the kernel against itself."""
+
+    def __init__(self, weight: torch.Tensor):
+        self.weight = weight
+
+    def forward_native(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return ir.ops.rms_norm.impls["native"].impl_fn(x, self.weight, EPS)
+        return ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+            x, residual, self.weight, EPS
+        )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size"), [(1, 1024), (83, 5137), (2048, 1024)]
+)
+@pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize("group_size", [None, [1, 128]])
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_rms_norm_fp32_weight(
+    default_vllm_config,
+    num_tokens: int,
+    hidden_size: int,
+    quant_dtype: torch.dtype,
+    group_size: list[int] | None,
+    add_residual: bool,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """An fp32 weight on fp16/bf16 activations (GemmaRMSNorm's `1 + w`) takes
+    the same fused dynamic per-token / per-block path as a same-dtype weight."""
+    if group_size is not None and hidden_size % group_size[1] != 0:
+        pytest.skip("hidden_size must be a multiple of the group size")
+    set_random_seed(0)
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+
+    weight = torch.empty(hidden_size, dtype=torch.float32).normal_(mean=1.0, std=0.1)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype) / hidden_size
+    residual = (
+        torch.randn(num_tokens, hidden_size, dtype=dtype) / hidden_size
+        if add_residual
+        else None
+    )
+
+    ref_out, ref_scales, ref_residual = ref_impl(
+        _NativeNorm(weight),  # type: ignore[arg-type]
+        x,
+        quant_dtype,
+        residual,
+        None,
+        group_size,
+    )
+    ops_out, ops_scales, ops_residual = ops_impl(
+        weight, x, quant_dtype, residual, None, group_size, 0
+    )
+
+    assert ops_out.dtype == quant_dtype
+    if group_size is None:
+        assert torch.allclose(ref_scales, ops_scales, rtol=1e-5, atol=1e-8)
+    else:
+        # A group abs-max can flip by one ULP between the fused and reference
+        # reductions; see test_rms_norm.
+        assert torch.allclose(ref_scales, ops_scales, rtol=1e-2, atol=1e-8)
+    if quant_dtype == torch.int8:
+        assert torch.allclose(ref_out, ops_out, atol=1)
+    else:
+        ulp = fp8_ulp_distance(ref_out, ops_out)
+        assert int(ulp.max()) <= 1
+        assert int((ulp > 0).sum().item()) <= ulp.numel() // 100_000 + 8
+    if add_residual:
+        assert torch.allclose(ref_residual, ops_residual)
