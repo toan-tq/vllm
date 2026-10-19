@@ -166,6 +166,13 @@ Full text with commands in `SURVEY-sm120-perf-gaps-2026-10-19.md`.
   the 5090, open since 2026-06-12, measured 1-5% at kernel level, no review) and
   #55360 (`E=128,N=768`). The blocker is maintainer attention. Action: post 5090
   e2e numbers on #45379 instead of a new PR.
++ **E (found after round 4, survey section 8):** gpt-oss on SM120 runs its MoE on
+  Marlin W4A16 although `FLASHINFER_CUTLASS_MXFP4_MXFP8` (FP4 tensor cores, MXFP8
+  activations, expert biases and the gpt-oss SwiGLU parameters wired) is accepted
+  on SM120 by vLLM's gate and tested on SM120 by FlashInfer; the BF16-first
+  activation filter keeps it out of auto-selection. Dense precedent on the same
+  architecture (#55170): TTFT −36%. One GPU day decides it; PR is a ~20-line
+  per-architecture policy change in the MXFP4 oracle, with GSM8K.
 + **D3:** A2 above. **D4:** attention default on SM120 (FA2 vs FlashInfer vs b12x),
   measurement only. **D5:** Mamba2 `replayssm` launch table keyed on SM100 only.
 + Set aside with reasons: merging the GDN projections (four PRs, maintainer prefers
@@ -198,6 +205,14 @@ here against the code and the PR pages.
   reaches "most likely > 10% with a high merge probability". Do not rent a GPU for
   them. Cheap and certain when a 5090 is in hand anyway: post D1 data on #56997
   and 5090 numbers for #45379's config on that PR.
++ **Added after round 4, Direction E** (survey section 8): gpt-oss on SM120 runs
+  its MoE through Marlin W4A16 while a FlashInfer CUTLASS MXFP4 x MXFP8 path is
+  already in-tree, gated to family 120, and tested on SM120 by FlashInfer; it is
+  only excluded from auto-selection by the BF16-activation-first filter. The
+  mechanism for a large prefill gain is the dense precedent in PR 55170 (TTFT down
+  36% on SM120). Needs one 5090 day (protocol in the survey); PR shape is about
+  20 lines in the MXFP4 oracle; odds about 0.3 for a default change; the floor is
+  a data comment on #31085.
 
 ## 8. Quick reproduction of the key claims
 

@@ -15,7 +15,12 @@ hay GELU+quant (nhánh B) chỉ ở mức 1 đến 3% và không phải chỗ đ
 với Marlin W4A16 (Humming dùng activation BF16 trên SM120, và SM120 không có WGMMA là
 lợi thế của #56997 trên SM90), nên kỳ vọng là hòa và sản phẩm là một bảng dữ liệu đăng
 lên #56997, không phải PR. D2 trùng #45379 (đúng shape, mở từ 12/6, đo được 1 đến 5%).
-Không hướng nào trong survey vượt bar trên 10%; không thuê GPU riêng cho việc này.
+Không hướng nào trong D1 đến D5 vượt bar trên 10%; không thuê GPU riêng cho chúng.
+**Hướng E (mục 8, tìm sau vòng 4):** gpt-oss trên SM120 đang chạy MoE bằng Marlin
+W4A16 trong khi đường FlashInfer CUTLASS MXFP4 × MXFP8 (tensor core FP4) đã có trong
+cây, được FlashInfer test trên SM120, và chỉ không được chọn mặc định vì bộ lọc
+"ưu tiên activation BF16". Cơ chế cho lợi ích lớn ở prefill là thật (tiền lệ dense là
+PR #55170: TTFT giảm 36%); cần một ngày đo trên 5090 để biết có PR hay không.
 
 ## 1. What landed for SM12x in the last two months (why the lane is crowded)
 
@@ -225,11 +230,15 @@ bounded by the SSM kernel's share of a decode step; a retune is a one-row change
 
 ## 5. Order of work (revised after review round 4)
 
-No direction in this survey clears a "most likely > 10% and high merge
-probability" bar; do not rent a GPU for any of them. Cheap, certain actions when a
-5090 is in hand for other reasons:
+None of D1-D5 clears a "most likely > 10% and high merge probability" bar; do not
+rent a GPU for them. Direction E (section 8) is the one item with a real > 10%
+mechanism and is worth one GPU day. Order:
 
-1. D1 as a measurement (three arms, GSM8K), posted as data on #56997.
+0. E: gpt-oss-20b on the 5090, Marlin vs `--moe-backend flashinfer_cutlass_afp8`
+   (and the Humming MXFP8 arm), prefill and decode, GSM8K. Section 8 has the
+   protocol and the PR shape.
+1. D1 as a measurement (three arms, GSM8K), posted as data on #56997; the Humming
+   MXFP8 arm is shared with E.
 2. 5090 e2e numbers for #45379's config posted on that PR with a maintainer ping
    (needs 2x5090), instead of a new config PR.
 3. D4 only if those runs show the 5090 behaving unlike GB10 in general.
@@ -261,3 +270,99 @@ grep -n "def _backend_activation_key" -A 20 vllm/model_executor/layers/fused_moe
 - "mgoin asked for per-arch data" in #56997 was wrong; only CI triggers.
 - Everything in sections 1 and 2 (commit list, DeepGEMM exclusion table,
   `replayssm` keying, model-fit table) was confirmed by the review.
+
+## 8. Direction E (found after round 4): gpt-oss on SM120 has an FP4 tensor-core MoE path in the tree that is never selected
+
+### The gap
+
+- On SM120 the gpt-oss MoE runs on **Marlin W4A16** (dequantize to BF16, BF16
+  `mma.sync`). Prefill is compute-bound there. The b12x MoE rejects expert biases,
+  OAI Triton is 10% slower at prefill (#58877), the CUTLASS `mxfp4_experts_quant`
+  path is SM10x/11x-only (`mxfp4_experts_quant_sm_supported` in
+  `csrc/quantization/fp4/mxfp4_experts_quant.cu`: `100 <= cc < 120`).
+- `FlashInferExperts` (`fused_moe/experts/flashinfer_cutlass_moe.py`) accepts
+  `(kMxfp4Static, kMxfp8Dynamic)` on `has_device_capability(100)`, which includes
+  12.0, lists family 120 as a supported device (with SM110 explicitly excluded),
+  supports `SWIGLUOAI`, and passes `fc1_expert_biases`/`fc2_expert_biases` and the
+  gpt-oss `swiglu_alpha=1.702, beta=1.0, limit=7.0`. The backend name is
+  `FLASHINFER_CUTLASS_MXFP4_MXFP8`, CLI alias `--moe-backend flashinfer_cutlass_afp8`.
+- It is never chosen automatically: `_get_priority_backends_for_gpt_oss` lists it
+  after TRITON, and `_filter_by_activation` keeps only BF16-activation variants
+  when the checkpoint requests no activation format (gpt-oss does not), so on SM120
+  the list collapses to MARLIN. The b12x branch of `_get_requested_backends` already
+  carries the opposite policy ("W4A8 is the high-throughput b12x path and is
+  preferred when the model does not request an activation format"), so a
+  per-architecture preference has precedent in the same file.
+- FlashInfer side: the SM120 CUTLASS fused-MoE module is built with
+  `-DCOMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS -DENABLE_FP8 -DENABLE_FP4` and
+  compiles `moe_gemm_kernels_fp8_fp4.cu` (`flashinfer/jit/fused_moe.py`);
+  FlashInfer's `tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_mxfp8_mxfp4`
+  runs on major 10, 11 and 12 ("MXFP8xMXFP4 is only supported on SM100, SM110 and
+  SM120/SM121") with the gpt-oss SwiGLU parameters, but without expert biases.
+  `cutlass_fused_moe` in `flashinfer/fused_moe/core.py` dispatches "120"/"121" and
+  has no SM gate on `use_mxfp8_act_scaling` or `use_w4_group_scaling`. A DGX Spark
+  (SM121) user reported the path running under vLLM (NVIDIA forum, "Run VLLM in
+  Spark"). vLLM issue #42118 documents it producing garbage **only under expert
+  parallelism** (unswizzled MXFP8 scales after all-to-all); single-GPU is not
+  affected.
+- Demand: issue #31085 (open since 2025-12, 20 comments) asks for native kernels on
+  SM120 for exactly this; the only numbers posted there are Marlin ~185 tok/s vs
+  Triton ~140 tok/s decode on an RTX PRO 6000 Max-Q. Nobody has posted the CUTLASS
+  MXFP4 x MXFP8 result on a 5090.
+
+### Why the gain can be large (and where it is not)
+
+- Dense precedent on the same architecture: #55170 switched Qwen3.8-27B-NVFP4 on an
+  RTX PRO 6000 from W4A16 to W4A4 CUTLASS: TTFT −36%, output +24% at BS1 with a 32K
+  cached prefix and 2K input; the author also notes W4A4 "loses BS1 decode by a few
+  percent". Expect the same shape here: a large prefill/TTFT win, decode parity or a
+  small loss.
+- Reference point for the 5090: LMSYS measured gpt-oss-20B MXFP4 under Ollama at
+  ~8.5k prompt tok/s and 205 tok/s decode on an RTX 5090; a 1.3-1.5x prefill change
+  is well above noise at that scale.
+- Not a decode optimization: at M=1 both paths read the same bytes.
+
+### Protocol (one 5090, gpt-oss-20b, median of 3)
+
+```bash
+for cfg in "marlin:--moe-backend marlin" "cutlass_afp8:--moe-backend flashinfer_cutlass_afp8" "triton:--moe-backend triton"; do
+  name=${cfg%%:*}; flags=${cfg#*:}
+  vllm serve openai/gpt-oss-20b $flags --max-model-len 16384 --port 8000 &
+  # wait for /health; identity gate: the log must print the selected MoE backend
+  for isl in 1024 4096 8192; do
+    vllm bench serve --model openai/gpt-oss-20b --dataset-name random \
+      --random-input-len $isl --random-output-len 128 --num-prompts 16 --max-concurrency 1 \
+      --save-result --result-dir results/E-$name-isl$isl
+  done
+  vllm bench serve --model openai/gpt-oss-20b --dataset-name random \
+    --random-input-len 1024 --random-output-len 256 --num-prompts 64 --max-concurrency 8 \
+    --save-result --result-dir results/E-$name-c8
+  python tests/evals/gsm8k/gsm8k_eval.py --port 8000 --num-questions 500
+  kill %1; wait
+done
+# fourth arm, shared with D1: Humming with MXFP8 activations
+# VLLM_HUMMING_INPUT_QUANT_CONFIG='{...}' vllm serve openai/gpt-oss-20b --moe-backend humming ...
+```
+
+Report TTFT per input length, decode TPOT at c=1 and c=8, output tok/s, GSM8K
+strict and flexible. If `flashinfer_cutlass_afp8` fails to start or produces
+garbage on the 5090, that failure is itself a bug report worth filing (FlashInfer
+tests cover the dtype pair on SM120 but not the expert-bias path).
+
+### Decision gate and PR shape
+
+- Gate: TTFT better by >= 20% at 4K-8K input, decode TPOT within ±5%, GSM8K within
+  ±1 point of Marlin.
+- PR if the gate passes: in `fused_moe/oracle/mxfp4.py`, prefer
+  `FLASHINFER_CUTLASS_MXFP4_MXFP8` over MARLIN on `is_device_capability_family(120)`
+  when the checkpoint requests no activation format, mirroring the b12x W4A8 policy,
+  plus an oracle test and the benchmark table in the description. Size: ~20 lines.
+  Expect a policy discussion (MXFP8 activations change numerics; on SM100 the
+  default keeps a BF16-activation kernel first), so bring GSM8K and, if possible,
+  a second eval. Fallback deliverable if maintainers keep it opt-in: the recipe
+  (`docs`/model recipe) and a one-line startup hint on SM12x.
+- Honest odds before any run: P(path runs correctly on a single 5090) ~0.7;
+  P(>= 20% TTFT | runs) ~0.6; P(decode and GSM8K within gate | runs) ~0.6; so
+  roughly 0.3 that a default-change PR is justified, with a data comment on #31085
+  as the floor outcome. This is the only item in this survey whose upside is above
+  10% on a workload single-5090 users actually run.
