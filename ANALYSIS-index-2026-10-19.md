@@ -9,10 +9,12 @@
 + FP8 quant cho Gemma) đã qua ba vòng review bên ngoài; vòng ba chứng minh A gần như
 không giảm launch ở đường compile mặc định. Giải pháp đúng cho bài GemmaRMSNorm là
 A2 (`weight_bias` trong kernel, idiom upstream), trần 1 đến 3%. Khảo sát hai tháng
-commit cho thấy chỗ đáng làm hơn trên RTX 5090 là **quyết định backend MoE mặc định
-bằng số đo thật** (Humming vs Marlin, D1) và **config Triton MoE cho 5090** (D2).
-Thứ tự đọc: mục 2 của file này, rồi `SURVEY-sm120-perf-gaps-2026-10-19.md`, rồi
-handoff của từng nhánh.
+commit xếp đầu hai hướng D1 (backend MoE mặc định, Humming vs Marlin) và D2 (config
+Triton MoE cho 5090), nhưng **review vòng 4 (19/10) bác cả hai**: D1 mặc định chỉ so
+W4A16 với W4A16 nên kỳ vọng hòa, D2 trùng #45379. Kết luận hiện tại: không hướng nào
+vượt bar trên 10%; việc rẻ và chắc là đăng số đo lên #56997 và #45379 khi sẵn 5090.
+Thứ tự đọc: mục 2 của file này, rồi `SURVEY-sm120-perf-gaps-2026-10-19.md` (mục 7
+trước), rồi handoff của từng nhánh.
 
 ## 1. Branches
 
@@ -85,8 +87,11 @@ heads fetched for comparison in the authoring checkout: `pr-45770`, `pr-59467`,
 + **B:** at most ~1% on a narrow checkpoint set; park unless a fused act+per-token
   FP8 kernel lands (#46273), which would widen the reach to the `-FP8-dynamic`
   checkpoints.
-+ **Better design for the GemmaRMSNorm problem:** A2 (section 4), ceiling 1-3%.
-+ **Better directions for the 5090:** D1 and D2 in the survey (section 5 below).
++ **Better design for the GemmaRMSNorm problem:** A2 (section 4), ceiling 1-3%,
+  and it would be the fifth PR in the same lane (#29810, #36016, #44693, #45770).
++ **Directions for the 5090:** D1 and D2 in the survey were the first ranking;
+  review round 4 (section 7) reduced D1 to a measurement and found D2 duplicated.
+  No surveyed direction clears a >10% bar.
 
 ## 4. A2: GemmaRMSNorm + quant fusion through `weight_bias` (design, not implemented)
 
@@ -105,10 +110,18 @@ becoming a kernel.
   Gemma access to the quant fusions, answer yes; the author measured ~2 us for the
   custom kernel vs ~6 us for the torch.compile Triton norm; xenova insisted the
   bias be added in fp32.
-+ #39014 (ZJY0516, merged Apr 2026): ProExpertProg wrote "I'd want to avoid an
-  extra triton kernel to convert to 32bit", which is exactly what branch A
-  introduces; the same PR recorded an accuracy failure (GGUF test) when `1 + w`
-  was rounded to bf16, which A2 avoids by adding in fp32 inside the kernel.
++ #39014 (ZJY0516, merged Apr 2026): ProExpertProg wrote "if `x` is 16bit and
+  produced by a custom kernel, I'd want to avoid an extra triton kernel to convert
+  to 32bit". That sentence is about converting the **activation** `x` to fp32, not
+  the weight (corrected in review round 4); it shows the fusion owner's dislike of
+  extra conversion kernels around the norm, which is analogous to branch A's
+  `(1 + w)` kernel but not a statement about it. The same PR had a Gemma GGUF
+  accuracy test fail; ZJY0516's stated cause is that the test switched from the
+  native path to the CUDA kernel ("gemma gguf test uses cuda kernel, but previous
+  is native implementation"), with no finer root cause in the thread. That is
+  evidence about the risk of moving GemmaRMSNorm onto the `vllm_c` kernel (branch
+  A's eager-path hunk, A-N2), not about `1 + w` rounding. A2 adds the bias in fp32
+  inside the kernel, which is what xenova asked for in #29810.
 + #36016 (jackzhxng, draft since Mar 2026, `needs-rebase`, no maintainer review):
   same idea with six duplicated `gemma_*` ops; heavier than a parameter.
 + RFC #43224 (mgoin): compiler fusions are to be ported to manual fusions
@@ -143,15 +156,16 @@ Full text with commands in `SURVEY-sm120-perf-gaps-2026-10-19.md`.
   on SM12x, XQA decode, Triton split-K retunes, OAI Triton MXFP4 on SM12x (behind
   Marlin: -10% prefill on a 5090, #58877), DeepGEMM auto-disabled per model on
   SM12x (#61274).
-+ **D1 (first):** measure Humming vs Marlin vs OAI Triton for gpt-oss-20b (MXFP4
-  with expert biases) and an NVFP4 MoE checkpoint on the 5090. Only GB10 data
-  exists (parity within ±8%, bandwidth-starved device); the 5090 has no numbers.
-  If Humming wins prefill and ties decode with GSM8K parity, the PR is one line
-  (`_HUMMING_PREFERRED_CAPABILITIES` gains `120`) with #56997 as precedent.
-+ **D2:** Triton fused-MoE tuned configs for `NVIDIA_GeForce_RTX_5090` (none exist;
-  the RTX PRO 6000 files do not apply by name). Matters when Triton is the expert
-  backend: block-FP8 MoE at TP=2 on 2x5090 and on RTX PRO 6000 Workstation.
-  Precedents +7% (#53819) and +21% (#54668), merged within days.
++ **D1 (corrected in round 4):** Humming defaults to BF16 activations on SM120
+  (`_backend_activation_key(HUMMING)` is `None`), and SM120 has no WGMMA, so the
+  proposed priority flip compares W4A16 with W4A16; expected parity, as on GB10.
+  The only arm with a tensor-core mechanism is Humming with MXFP8 activations via
+  `VLLM_HUMMING_INPUT_QUANT_CONFIG`, which changes numerics. Product: a data
+  comment on #56997 when a 5090 is in hand, not a PR.
++ **D2 (corrected in round 4):** duplicates #45379 (`E=256,N=256` block-FP8 for
+  the 5090, open since 2026-06-12, measured 1-5% at kernel level, no review) and
+  #55360 (`E=128,N=768`). The blocker is maintainer attention. Action: post 5090
+  e2e numbers on #45379 instead of a new PR.
 + **D3:** A2 above. **D4:** attention default on SM120 (FA2 vs FlashInfer vs b12x),
   measurement only. **D5:** Mamba2 `replayssm` launch table keyed on SM100 only.
 + Set aside with reasons: merging the GDN projections (four PRs, maintainer prefers
@@ -166,7 +180,26 @@ Full text with commands in `SURVEY-sm120-perf-gaps-2026-10-19.md`.
 + D1/D2 outcomes depend entirely on 5090 measurements; the survey gives the
   commands, identity gates and decision thresholds.
 
-## 7. Quick reproduction of the key claims
+## 7. Review round 4 (2026-10-19) and the bottom line
+
+Checked against `origin/main` `c07c59f821` and GitHub by the reviewer; confirmed
+here against the code and the PR pages.
+
++ Confirmed: the round-3 conclusion on branch A, the A2 idiom (all-reduce fusion),
+  the #29810 history, every commit in the survey's SM12x table, the DeepGEMM
+  exclusion table, the `replayssm` keying.
++ Corrected: the two #39014 citations (section 4); D1's mechanism (Humming W4A16 by
+  default, no WGMMA on SM120); D2 duplicates #45379 and #55360; "mgoin asked for
+  per-arch data" was wrong.
++ Reviewer's prediction for D1 on a 5090: decode within ±5%, prefill within ±10%,
+  no stable winner (P ~0.7); P(Humming >= 10% prefill win with decode parity)
+  ~0.15.
++ **Bottom line after four rounds:** none of the branches or surveyed directions
+  reaches "most likely > 10% with a high merge probability". Do not rent a GPU for
+  them. Cheap and certain when a 5090 is in hand anyway: post D1 data on #56997
+  and 5090 numbers for #45379's config on that PR.
+
+## 8. Quick reproduction of the key claims
 
 ```bash
 git fetch upstream main pull/45770/head:pr-45770 pull/59467/head:pr-59467 pull/36016/head:pr-36016

@@ -11,9 +11,11 @@ SM12x, Triton split-K cho SM120). Kẽ hở còn lại không nằm ở "thiếu
 **chọn backend mặc định cho consumer Blackwell chưa có số đo trên RTX 5090** và ở
 **config Triton MoE chưa tune cho card này**. Các fusion kiểu RMSNorm+quant (nhánh A)
 hay GELU+quant (nhánh B) chỉ ở mức 1 đến 3% và không phải chỗ đáng bỏ công nhất.
-Hướng được xếp đầu: đo Humming / Marlin / OAI-Triton cho MoE MXFP4 (gpt-oss) và NVFP4
-(Qwen3.6-35B-A3B) trên 5090; nếu Humming thắng rõ ở prefill và hòa ở decode, PR là một
-dòng (thêm `120` vào `_HUMMING_PREFERRED_CAPABILITIES`) với tiền lệ #56997.
+**Đính chính sau review vòng 4 (19/10, mục 7):** D1 theo mặc định chỉ so Humming W4A16
+với Marlin W4A16 (Humming dùng activation BF16 trên SM120, và SM120 không có WGMMA là
+lợi thế của #56997 trên SM90), nên kỳ vọng là hòa và sản phẩm là một bảng dữ liệu đăng
+lên #56997, không phải PR. D2 trùng #45379 (đúng shape, mở từ 12/6, đo được 1 đến 5%).
+Không hướng nào trong survey vượt bar trên 10%; không thuê GPU riêng cho việc này.
 
 ## 1. What landed for SM12x in the last two months (why the lane is crowded)
 
@@ -52,33 +54,48 @@ the Triton FP8 MoE config gap matters for 2x5090 and RTX PRO 6000 Workstation us
 
 ### D1. MoE backend default on SM120: measure Humming vs Marlin (vs OAI Triton) on a 5090
 
-- **Mechanism.** Humming on SM12x runs MXFP4 weights with MXFP8 activations through
-  the native block-scaled tensor-core path (`quantization/utils/humming/schema.py`:
-  `sm_version >= 120 and is_mx_weight` selects group-32 e8m0 dynamic input quant).
-  Marlin is W4A16: dequantize to BF16, then BF16 MMA. At decode both are
-  bandwidth-bound and should tie; at prefill the FP4 MMA path should win, which is
-  the same argument that made Humming the default on SM90 (#56997: "Humming supports
-  WGMMA on SM90 and delivers significantly better performance than Marlin").
+> Corrected after review round 4 (section 7). The first version of this section
+> claimed Humming would use MXFP8 activations on SM12x by default; it does not.
+
+- **Mechanism (corrected).** By default Humming runs MXFP4 MoE with **BF16
+  activations**: `_backend_activation_key(HUMMING)` returns `None`
+  (`fused_moe/oracle/mxfp4.py`), and the Humming branch of that oracle only takes
+  the checkpoint's activation scheme when the checkpoint declares one (gpt-oss does
+  not) or `VLLM_HUMMING_INPUT_QUANT_CONFIG` is set ("Humming's default BF16
+  activations", lines ~1637-1650). So adding `120` to
+  `_HUMMING_PREFERRED_CAPABILITIES` compares Humming W4A16 with Marlin W4A16: both
+  dequantize to BF16 and run `mma.sync`, because SM120 has no WGMMA, which is the
+  SM90 advantage #56997 relied on ("Humming supports WGMMA on SM90"). The GB10
+  parity result is most likely explained by this, not only by bandwidth.
+- **The only arm with a tensor-core mechanism** is Humming with MXFP8 activations
+  forced through `VLLM_HUMMING_INPUT_QUANT_CONFIG` (group-32 e8m0 dynamic input
+  quant; `quantization/utils/humming/schema.py`, `sm_version >= 120 and
+  is_mx_weight`). That changes numerics (activations quantized to MXFP8), so it is a
+  default-input-schema decision with GSM8K evidence, not a priority flip, and the
+  Humming author (jinzhen-lin) said in #56997 they would look into the GB10 result
+  themselves.
 - **Why it is open.** `_HUMMING_PREFERRED_CAPABILITIES = frozenset({90})`
   (`quantization/utils/humming/priority.py`). In #56997 the only non-SM90 data was
   carmenlok's GB10 (SM121, DGX Spark, ~273 GB/s): Qwen3-30B-A3B MXFP8 and NVFP4,
   "parity within about ±8%, no consistent winner", GSM8K 0.867-0.892 across
-  backends; an RTX PRO 6000 rerun was offered and never posted. GB10 is so
-  bandwidth-starved that compute differences cannot show; the 5090 (1.79 TB/s,
-  170 SMs) is a different regime and has **no posted numbers**.
+  backends; an RTX PRO 6000 rerun was offered and never posted. mgoin's only
+  comments there were CI triggers; nobody asked for per-arch data. The 5090 has
+  **no posted numbers**, but given the mechanism above the expected result is
+  parity.
 - **Also in play.** OAI Triton MXFP4 on SM12x: decode equal to Marlin, prefill 10%
   slower (#58877, measured on a 5090). b12x auto-selection (#54669, open): on an
   RTX PRO 6000, B12X decodes 11.8% faster at c=1 but TTFT +55% at 1K input and
   GSM8K 0.945 vs Marlin 0.970 (waynehacking8, Oct 17), so b12x is not the answer
   for the default either; and b12x MoE rejects expert biases (gpt-oss).
-- **Expected impact if Humming wins.** Prefill-heavy and mixed workloads of the
-  most-run model on 5090s (gpt-oss-20b) and NVFP4 MoE checkpoints: tens of percent
-  of TTFT is plausible, decode parity. If it ties (as on GB10), the result is still
-  a useful negative that closes the question for maintainers.
-- **Deliverable.** One-line PR adding `120` to `_HUMMING_PREFERRED_CAPABILITIES`
-  (or a finer rule if only MXFP4 wins), with the benchmark table and GSM8K parity.
-  Mergeability is high: #56997 is the exact precedent and mgoin asked for per-arch
-  data there.
+- **Expected outcome (review round 4 prediction, before any run).** gpt-oss-20b on
+  a 5090, Humming W4A16 vs Marlin: decode within ±5%, prefill within ±10%, no
+  stable winner (P ~0.7). P(Humming >= 10% faster at prefill and tied at decode)
+  ~0.15. The MXFP8-activation arm is the only one that can move the number, at an
+  accuracy cost to be measured.
+- **Deliverable.** Most likely a data comment on #56997 (three arms, GSM8K), which
+  closes an open question for the maintainers. A PR only if the MXFP8 arm wins
+  clearly with GSM8K parity, and then it is a default-input-schema change to
+  discuss with the Humming author first, not a one-liner.
 - **Protocol (5090, same checkpoint, same engine flags, median of 3 runs each):**
 
   ```bash
@@ -95,20 +112,44 @@ the Triton FP8 MoE config gap matters for 2x5090 and RTX PRO 6000 Workstation us
     python tests/evals/gsm8k/gsm8k_eval.py --port 8000 --num-questions 500
     kill %1; wait
   done
+  # third arm: Humming with MXFP8 activations (group-32 e8m0 dynamic); schema fields in
+  # vllm/model_executor/layers/quantization/utils/humming/schema.py, env in vllm/envs.py
+  VLLM_HUMMING_INPUT_QUANT_CONFIG='{...}' vllm serve openai/gpt-oss-20b --moe-backend humming ...
   # NVFP4 MoE: repeat with nvidia/Qwen3.6-35B-A3B-NVFP4 (auto vs humming vs marlin)
   ```
 
-  Identity gate: the startup log must print the selected MoE backend
-  (`Using ... backend` from the oracle); confirm it per run before reading numbers.
-  Report TTFT, TPOT, output tok/s per concurrency, and GSM8K (strict and flexible).
-- **Decision gate.** Open the PR only if Humming is within noise at decode for all
-  concurrencies, better by >= 10% at prefill/TTFT, and GSM8K is within ±1 point.
-  If Marlin wins or ties, post the table on #56997 instead (closes the open
-  question; no code).
+  Identity gate: the startup log must print the selected MoE backend and, for
+  Humming, the resolved input schema (BF16 vs MXFP8); confirm per run before
+  reading numbers. Report TTFT, TPOT, output tok/s per concurrency, and GSM8K
+  (strict and flexible).
+- **Decision gate.** Post the table on #56997 in every case. Consider a PR only if
+  an arm is within noise at decode for all concurrencies, better by >= 10% at
+  prefill/TTFT, and GSM8K is within ±1 point; for the MXFP8 arm, agree the default
+  with the Humming author first. Do not rent a GPU for this; run it when a 5090 is
+  in hand for other work.
 
 ### D2. Triton fused-MoE tuned configs for RTX 5090 (and RTX PRO 6000 Workstation)
 
-- **Gap.** `vllm/model_executor/layers/fused_moe/configs/` has no
+> Corrected after review round 4 (section 7): this is **already claimed by open
+> PRs**; the first version of this section missed them (the duplicate check only
+> looked at merged commits in `configs/`).
+
+- **Duplicates.** #45379 (shpgy-shpgy, opened 2026-06-12, open, no review, no
+  labels): `E=256,N=256,device_name=NVIDIA_GeForce_RTX_5090,dtype=fp8_w8a8,block_shape=[128,128]`,
+  the exact Qwen3.5-35B-A3B-FP8 TP=2 shape this section ranked first; its own
+  5090 numbers are kernel latency −1.8% to −5.4% for batch 1-512 and ~0 at
+  2k-4k. #55360 (CharlesXu-HQ, 2026-09-04): `E=128,N=768` block-FP8 for the 5090.
+  The review also lists #51519 (E=128, bf16), #39263 (four bf16 files) and the
+  closed #55956; not checked here. The H20 and L40S precedents were merged within
+  days, these 5090 PRs have had no maintainer attention for months: the blocker
+  is attention, not missing files. The only unclaimed shape is Qwen3-30B-A3B-FP8
+  at TP=2 (`E=128,N=384`), too small for a PR of its own.
+- **Action instead of a new PR.** If a 2x5090 run happens anyway, post e2e numbers
+  (default vs `VLLM_TUNED_CONFIG_FOLDER` with the PR's file) on #45379 and
+  @-mention the maintainers who merged the H20/L40S configs (jeejeelee) and the
+  requested reviewers (mgoin, pavanimajety, zyongye). Note that this needs two
+  cards; a single 5090 does not reach this path (section 2).
+- **Gap (as originally stated).** `vllm/model_executor/layers/fused_moe/configs/` has no
   `device_name=NVIDIA_GeForce_RTX_5090` file at all; the lookup is by exact device
   name (`get_config_file_name`), so the RTX PRO 6000 Server configs do not apply.
   Without a file, `get_default_config` is used, whose block-FP8 branch was tuned on
@@ -123,7 +164,9 @@ the Triton FP8 MoE config gap matters for 2x5090 and RTX PRO 6000 Workstation us
 - **Precedent and size of gain.** `12579c7f01` #54668 "Tune H20 block-FP8 MoE
   low-batch configs (+21%)", `044b05220e` #53819 "Tune fused_moe FP8 config for
   Qwen3.5 on L40S (+7%)", `7ea4b40954` #52502 GB10 configs for E=256/E=512,
-  `f2e2936f91` #55511 A100 E=256,N=512: all merged within days, JSON only.
+  `f2e2936f91` #55511 A100 E=256,N=512: all merged within days, JSON only. On the
+  5090 itself the measured kernel gain in #45379 is only 1-5%, far from the H20
+  figure, so the e2e effect is likely in the low single digits.
 - **Protocol.**
 
   ```bash
@@ -180,16 +223,19 @@ bounded by the SSM kernel's share of a decode step; a retune is a one-row change
 - **OAI Triton MXFP4 as default on SM12x** (#58877): slower prefill on a 5090.
 - **Norm / activation fusions** (branches A and B): 1-3% class, see their handoffs.
 
-## 5. Order of work
+## 5. Order of work (revised after review round 4)
 
-1. D1 on the 5090 (one day of runs). Outcome either a one-line PR with a strong
-   table, or a data comment on #56997.
-2. D2 in the background while D1 models are loaded (tuner runs take tens of
-   minutes per shape); PR with JSON files and the before/after table.
-3. D4 if D1 shows the 5090 behaves differently from GB10 in general.
+No direction in this survey clears a "most likely > 10% and high merge
+probability" bar; do not rent a GPU for any of them. Cheap, certain actions when a
+5090 is in hand for other reasons:
+
+1. D1 as a measurement (three arms, GSM8K), posted as data on #56997.
+2. 5090 e2e numbers for #45379's config posted on that PR with a maintainer ping
+   (needs 2x5090), instead of a new config PR.
+3. D4 only if those runs show the 5090 behaving unlike GB10 in general.
 4. D3/D5 only on demand.
 
-## 6. Reproduction of this survey
+## 6. Reproduction of this survey (section 7 lists what later checks corrected)
 
 ```bash
 git fetch --shallow-since=2026-08-10 upstream main
@@ -201,4 +247,17 @@ sed -n 18,45p vllm/utils/deep_gemm.py
 gh pr view 56997 --repo vllm-project/vllm --comments   # GB10 parity table
 gh pr view 58877 --repo vllm-project/vllm              # OAI Triton on 5090: -10% prefill
 gh pr view 54669 --repo vllm-project/vllm --comments   # b12x vs Marlin on RTX PRO 6000
+gh pr view 45379 --repo vllm-project/vllm              # existing RTX 5090 E=256,N=256 config PR
+grep -n "def _backend_activation_key" -A 20 vllm/model_executor/layers/fused_moe/oracle/mxfp4.py   # HUMMING -> None (BF16)
 ```
+
+## 7. Review round 4 (2026-10-19): corrections to this survey
+
+- D1 mechanism was wrong: Humming defaults to BF16 activations on SM120, so the
+  proposed priority flip compares W4A16 with W4A16; SM120 has no WGMMA. Expected
+  result parity; product is a data comment.
+- D2 is a duplicate of #45379 (exact shape) and #55360; the blocker is maintainer
+  attention. The 5090 gain measured there is 1-5%, not the H20 +21%.
+- "mgoin asked for per-arch data" in #56997 was wrong; only CI triggers.
+- Everything in sections 1 and 2 (commit list, DeepGEMM exclusion table,
+  `replayssm` keying, model-fit table) was confirmed by the review.
