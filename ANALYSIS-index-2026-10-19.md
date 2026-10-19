@@ -166,13 +166,17 @@ Full text with commands in `SURVEY-sm120-perf-gaps-2026-10-19.md`.
   the 5090, open since 2026-06-12, measured 1-5% at kernel level, no review) and
   #55360 (`E=128,N=768`). The blocker is maintainer attention. Action: post 5090
   e2e numbers on #45379 instead of a new PR.
-+ **E (found after round 4, survey section 8):** gpt-oss on SM120 runs its MoE on
-  Marlin W4A16 although `FLASHINFER_CUTLASS_MXFP4_MXFP8` (FP4 tensor cores, MXFP8
-  activations, expert biases and the gpt-oss SwiGLU parameters wired) is accepted
-  on SM120 by vLLM's gate and tested on SM120 by FlashInfer; the BF16-first
-  activation filter keeps it out of auto-selection. Dense precedent on the same
-  architecture (#55170): TTFT −36%. One GPU day decides it; PR is a ~20-line
-  per-architecture policy change in the MXFP4 oracle, with GSM8K.
++ **E (found after round 4, downgraded after round 5; survey section 8):** gpt-oss
+  on SM120 runs its MoE on Marlin W4A16 although `FLASHINFER_CUTLASS_MXFP4_MXFP8`
+  (MXFP8 activations, expert biases and the gpt-oss SwiGLU parameters wired) is
+  accepted on SM120 by vLLM's gate and tested on SM120 by FlashInfer; the
+  BF16-first activation filter keeps it out of auto-selection. Round 5 showed that
+  filter is the contract mgoin wrote into PR 60079 on Oct 8 ("Activations are
+  never quantized below what the checkpoint declares"), that the only MoE W4A4
+  data on SM120 (PR 51158) is TTFT 1.14x at c=1 and 1.23x at c=8 with slower
+  decode, and that the same-shaped NVFP4 default change (PR 47577, TTFT −25% at
+  8K, decode +3.5%) was closed by its author on Oct 17 unreviewed. No GPU day;
+  a 30-minute opt-in smoke test if a 5090 is in hand, bug report if it breaks.
 + **D3:** A2 above. **D4:** attention default on SM120 (FA2 vs FlashInfer vs b12x),
   measurement only. **D5:** Mamba2 `replayssm` launch table keyed on SM100 only.
 + Set aside with reasons: merging the GDN projections (four PRs, maintainer prefers
@@ -208,11 +212,28 @@ here against the code and the PR pages.
 + **Added after round 4, Direction E** (survey section 8): gpt-oss on SM120 runs
   its MoE through Marlin W4A16 while a FlashInfer CUTLASS MXFP4 x MXFP8 path is
   already in-tree, gated to family 120, and tested on SM120 by FlashInfer; it is
-  only excluded from auto-selection by the BF16-activation-first filter. The
-  mechanism for a large prefill gain is the dense precedent in PR 55170 (TTFT down
-  36% on SM120). Needs one 5090 day (protocol in the survey); PR shape is about
-  20 lines in the MXFP4 oracle; odds about 0.3 for a default change; the floor is
-  a data comment on #31085.
+  only excluded from auto-selection by the BF16-activation-first filter. As
+  written after round 4 this estimated 0.3 for a default-change PR on the strength
+  of the dense precedent PR 55170 (TTFT down 36%).
++ **Review round 5 (2026-10-19) on E, all six points checked:** (1) the filter is
+  the oracle contract in PR 60079, merged Oct 8, "Activations are never quantized
+  below what the checkpoint declares", and gpt-oss passes no activation key;
+  (2) PR 51158 measured CUTLASS MXFP4 W4A4 MoE on an RTX PRO 5000: TTFT 1.14x at
+  c=1, 1.23x at c=8, 1.65x at c=16, decode 10% slower at c=1, open since Aug 5
+  without review; (3) the b12x W4A8 policy runs only for an explicit
+  `--moe-backend b12x`; (4) issue 31085 is titled NVFP4 MoE although it opened
+  with gpt-oss MXFP4; (5) PR 55170 is dense-only; (6) the reviewer's lead G3 of
+  Oct 15 is not checkable here. Found in addition: PR 47577, the same-shaped
+  SM120 default change for NVFP4 B12X, TTFT −25% at 8K and decode +3.5%, got no
+  review in three and a half months and was closed by its author on Oct 17.
+  Revised odds 0.02-0.05 for a default-change PR. E is reduced to a 30-minute
+  opt-in smoke test when a 5090 is in hand; a failure with expert biases is a
+  bug report, a clean run is a recipe note.
++ **Bottom line after five rounds:** unchanged from round 4, with E removed as a
+  reason to rent a GPU. Side effect to know: commits on the public fork that cite
+  upstream issue numbers appear as cross-references on those issues (31085 shows
+  an Oct 19 docs commit); write "PR 12345" without the hash in handoff docs when
+  that is unwanted.
 
 ## 8. Quick reproduction of the key claims
 
